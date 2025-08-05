@@ -153,16 +153,114 @@ class ThetaBulkDownloader:
         self._load_download_history()
     
     def _load_download_history(self):
-        """Load history of already downloaded files."""
+        """Load history of already downloaded files and validate existing files."""
         history_file = self.results_dir / "download_history.json"
+        self.downloaded_files = set()
+        
+        # First, scan actual files on disk and validate them
+        existing_files = self._scan_and_validate_existing_files()
+        
+        # Load history file if it exists
         if history_file.exists():
             try:
                 with open(history_file, 'r') as f:
                     history = json.load(f)
-                    self.downloaded_files = set(history.get('downloaded_files', []))
-                logger.info(f"Loaded {len(self.downloaded_files)} previously downloaded files")
+                    history_files = set(history.get('downloaded_files', []))
+                    
+                # Only keep files that both exist in history AND on disk
+                self.downloaded_files = existing_files.intersection(history_files)
+                
+                # If there's a mismatch, update the history
+                if existing_files != history_files:
+                    logger.info(f"Updating download history to match existing files")
+                    self._save_download_history()
+                    
             except Exception as e:
                 logger.warning(f"Could not load download history: {e}")
+                # Fall back to just the validated existing files
+                self.downloaded_files = existing_files
+        else:
+            # No history file, use validated existing files
+            self.downloaded_files = existing_files
+            if self.downloaded_files:
+                self._save_download_history()
+        
+        logger.info(f"Resume: Found {len(self.downloaded_files)} valid previously downloaded files")
+    
+    def _scan_and_validate_existing_files(self) -> Set[str]:
+        """Scan the output directory and validate existing files."""
+        validated_files = set()
+        
+        if not self.options_dir.exists():
+            return validated_files
+            
+        # Scan for CSV files matching our naming pattern
+        for file_path in self.options_dir.glob("*_options_*_*.csv"):
+            try:
+                # Parse filename to extract components
+                name_parts = file_path.stem.split("_")
+                if len(name_parts) >= 4:
+                    symbol = name_parts[0]
+                    date = name_parts[2]  # Skip "options" part
+                    interval = name_parts[3]
+                    
+                    # Validate file has reasonable size (more than just header)
+                    if file_path.stat().st_size > 200:  # At least 200 bytes
+                        # Quick validation: check if file has data rows
+                        try:
+                            with open(file_path, 'r') as f:
+                                lines = [next(f) for _ in range(2)]  # Read first 2 lines
+                                if len(lines) >= 2:  # Header + at least one data row
+                                    file_key = self.generate_file_key(symbol, date, interval)
+                                    validated_files.add(file_key)
+                                    logger.debug(f"Validated existing file: {file_path.name}")
+                                else:
+                                    logger.warning(f"File too small, removing: {file_path.name}")
+                                    file_path.unlink()
+                        except Exception as e:
+                            logger.warning(f"Invalid file, removing: {file_path.name} - {e}")
+                            file_path.unlink()
+                    else:
+                        logger.warning(f"File too small, removing: {file_path.name}")
+                        file_path.unlink()
+                        
+            except Exception as e:
+                logger.warning(f"Error processing file {file_path}: {e}")
+        
+        return validated_files
+    
+    def get_resume_status(self, symbols: List[str], start_date: str, end_date: str, interval: str) -> Dict:
+        """Get detailed resume status for the requested download job."""
+        # Calculate all required dates
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        required_files = []
+        current = start
+        while current <= end:
+            if current.weekday() < 5:  # Only weekdays
+                date_str = current.strftime("%Y-%m-%d")
+                for symbol in symbols:
+                    file_key = self.generate_file_key(symbol, date_str, interval)
+                    required_files.append({
+                        'key': file_key,
+                        'symbol': symbol,
+                        'date': date_str,
+                        'downloaded': file_key in self.downloaded_files
+                    })
+            current += timedelta(days=1)
+        
+        downloaded_count = sum(1 for f in required_files if f['downloaded'])
+        total_count = len(required_files)
+        
+        return {
+            'total_files': total_count,
+            'downloaded_files': downloaded_count,
+            'remaining_files': total_count - downloaded_count,
+            'completion_percent': (downloaded_count / total_count * 100) if total_count > 0 else 0,
+            'files': required_files,
+            'can_resume': downloaded_count > 0 and downloaded_count < total_count
+        }
     
     def _save_download_history(self):
         """Save history of downloaded files."""
@@ -273,9 +371,10 @@ class ThetaBulkDownloader:
                 return False
     
     async def download_symbol_range(self, symbol: str, start_date: str, end_date: str, 
-                                  interval: str = "1m", progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, bool]:
+                                  interval: str = "1m", progress_tracker: Optional[ProgressTracker] = None,
+                                  files_to_download: Optional[List] = None) -> Dict[str, bool]:
         """
-        Download options data for a symbol across a date range.
+        Download options data for a symbol across a date range with resume support.
         
         Args:
             symbol: Stock symbol
@@ -283,6 +382,7 @@ class ThetaBulkDownloader:
             end_date: End date in YYYY-MM-DD format
             interval: Time interval
             progress_tracker: Optional progress tracker for UI updates
+            files_to_download: Optional list of specific files to download (for resume)
             
         Returns:
             Dict mapping date to success status
@@ -290,40 +390,64 @@ class ThetaBulkDownloader:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
         
-        dates = []
+        # Get all dates in range
+        all_dates = []
         current = start
         while current <= end:
-            # Only include weekdays (skip weekends)
-            if current.weekday() < 5:
-                dates.append(current.strftime("%Y-%m-%d"))
+            if current.weekday() < 5:  # Only include weekdays
+                all_dates.append(current.strftime("%Y-%m-%d"))
             current += timedelta(days=1)
         
-        # Log at debug level only
-        logger.debug(f"Downloading {symbol} options data for {len(dates)} trading days from {start_date} to {end_date}")
+        # Filter dates if specific files are provided (for resume)
+        if files_to_download is not None:
+            dates_to_download = []
+            for file_info in files_to_download:
+                if file_info['symbol'] == symbol and file_info['date'] in all_dates:
+                    dates_to_download.append(file_info['date'])
+        else:
+            dates_to_download = all_dates
         
-        # Create download tasks
+        # Log at debug level only
+        logger.debug(f"Downloading {symbol} options data for {len(dates_to_download)} trading days from {start_date} to {end_date}")
+        
+        # Create download tasks only for dates that need downloading
         tasks = []
-        for date in dates:
+        for date in dates_to_download:
             task = self._download_with_progress(symbol, date, interval, progress_tracker)
             tasks.append(task)
         
         # Execute downloads concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            results = []
         
-        # Process results
+        # Process results - include both downloaded and already-existing files
         date_results = {}
-        for date, result in zip(dates, results):
-            if isinstance(result, Exception):
-                logger.error(f"Exception for {symbol} {date}: {result}")
-                date_results[date] = False
+        download_index = 0
+        
+        for date in all_dates:
+            file_key = self.generate_file_key(symbol, date, interval)
+            
+            if date in dates_to_download:
+                # This date was downloaded in this session
+                result = results[download_index]
+                download_index += 1
+                
+                if isinstance(result, Exception):
+                    logger.error(f"Exception for {symbol} {date}: {result}")
+                    date_results[date] = False
+                else:
+                    date_results[date] = result
             else:
-                date_results[date] = result
+                # This date was already downloaded (resume case)
+                date_results[date] = file_key in self.downloaded_files
         
         # Save progress
         self._save_download_history()
         
         success_count = sum(1 for success in date_results.values() if success)
-        logger.debug(f"Completed {symbol}: {success_count}/{len(dates)} days successful")
+        logger.debug(f"Completed {symbol}: {success_count}/{len(all_dates)} days successful")
         
         return date_results
     
@@ -341,7 +465,7 @@ class ThetaBulkDownloader:
     async def download_multiple_symbols(self, symbols: List[str], start_date: str, 
                                       end_date: str, interval: str = "1m") -> Dict[str, Dict[str, bool]]:
         """
-        Download options data for multiple symbols across a date range.
+        Download options data for multiple symbols across a date range with intelligent resume.
         
         Args:
             symbols: List of stock symbols
@@ -354,27 +478,68 @@ class ThetaBulkDownloader:
         """
         logger.info(f"Starting bulk download for {len(symbols)} symbols: {', '.join(symbols)}")
         
-        # Calculate total number of trading days for progress tracking
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        # Get resume status
+        resume_status = self.get_resume_status(symbols, start_date, end_date, interval)
         
-        total_days = 0
-        current = start
-        while current <= end:
-            if current.weekday() < 5:  # Only count weekdays
-                total_days += 1
-            current += timedelta(days=1)
+        # Display resume information
+        if resume_status['can_resume']:
+            print(f"📂 Resume Status:")
+            print(f"   Previously Downloaded: {resume_status['downloaded_files']}/{resume_status['total_files']} files")
+            print(f"   Completion: {resume_status['completion_percent']:.1f}%")
+            print(f"   Remaining: {resume_status['remaining_files']} files to download")
+            print()
+        elif resume_status['downloaded_files'] > 0:
+            print(f"📂 All {resume_status['total_files']} files already downloaded - nothing to do!")
+            print()
+            # Return success status for all files
+            all_results = {}
+            for symbol in symbols:
+                symbol_results = {}
+                for file_info in resume_status['files']:
+                    if file_info['symbol'] == symbol:
+                        symbol_results[file_info['date']] = True
+                all_results[symbol] = symbol_results
+            return all_results
         
-        total_tasks = len(symbols) * total_days
+        # Calculate what needs to be downloaded
+        files_to_download = [f for f in resume_status['files'] if not f['downloaded']]
+        total_tasks = len(files_to_download)
+        
+        if total_tasks == 0:
+            print("✅ All files already downloaded!")
+            return {}
+        
+        # Show download plan
+        trading_days = len(set(f['date'] for f in files_to_download))
+        print(f"📅 Downloading {trading_days} trading days for {len(symbols)} symbol(s) - {total_tasks} total files")
+        if resume_status['can_resume']:
+            print(f"🔄 Resuming from {resume_status['completion_percent']:.1f}% completion")
+        print()
+        
+        # Initialize progress tracker for remaining files
         progress_tracker = ProgressTracker(total_tasks)
         
-        print(f"📅 Downloading {total_days} trading days for {len(symbols)} symbol(s) - {total_tasks} total files")
-        print()  # Space for progress bar
-        
+        # Group files by symbol for organized downloading
         all_results = {}
         for symbol in symbols:
+            symbol_files = [f for f in files_to_download if f['symbol'] == symbol]
+            
+            if not symbol_files:
+                # All files for this symbol already downloaded
+                symbol_results = {}
+                for file_info in resume_status['files']:
+                    if file_info['symbol'] == symbol:
+                        symbol_results[file_info['date']] = True
+                all_results[symbol] = symbol_results
+                continue
+            
+            # Download missing files for this symbol
+            symbol_dates = [f['date'] for f in symbol_files]
+            min_date = min(symbol_dates)
+            max_date = max(symbol_dates)
+            
             symbol_results = await self.download_symbol_range(
-                symbol, start_date, end_date, interval, progress_tracker
+                symbol, min_date, max_date, interval, progress_tracker, files_to_download
             )
             all_results[symbol] = symbol_results
             
@@ -384,7 +549,7 @@ class ThetaBulkDownloader:
         
         # Ensure progress is complete
         progress_tracker.finish()
-        print()  # Space after progress completion
+        print()
         
         self._save_download_history()
         return all_results
@@ -471,14 +636,21 @@ async def main():
             max_concurrent=DOWNLOAD_CONFIG['max_concurrent'],
             output_dir=OUTPUT_CONFIG['options_dir']
         ) as downloader:
-            # Show existing data summary
-            summary = downloader.get_download_summary()
+            # Show resume status
+            resume_status = downloader.get_resume_status(
+                DOWNLOAD_CONFIG['symbols'],
+                DOWNLOAD_CONFIG['start_date'],
+                DOWNLOAD_CONFIG['end_date'],
+                DOWNLOAD_CONFIG['interval']
+            )
             
-            if summary['total_files'] > 0:
-                print(f"📁 Found {summary['total_files']} existing files ({summary['total_size_bytes']:,} bytes)")
-                print(f"   Symbols: {', '.join(summary['symbols'])}")
-                if summary['date_range']['min']:
-                    print(f"   Date Range: {summary['date_range']['min']} to {summary['date_range']['max']}")
+            if resume_status['downloaded_files'] > 0:
+                print(f"📁 Found {resume_status['downloaded_files']} existing files")
+                if resume_status['can_resume']:
+                    print(f"   Progress: {resume_status['completion_percent']:.1f}% complete")
+                    print(f"   Remaining: {resume_status['remaining_files']} files to download")
+                elif resume_status['downloaded_files'] == resume_status['total_files']:
+                    print(f"   Status: All files complete! ✅")
                 print()
             
             # Download data
