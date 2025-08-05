@@ -10,9 +10,9 @@ DOWNLOAD_CONFIG = {
     # Symbols to download (QQQ only as requested)
     "symbols": ["QQQ"],
     
-    # Date range for download (8 YEARS of QQQ historical data!)
-    "start_date": "2016-08-04",  # 8 years back - will find actual boundary
-    "end_date": "2024-08-02",    # Last Friday - start from here and work backwards
+    # Date range for download (8+ YEARS of QQQ historical data!)
+    "start_date": "2016-08-04",  # 8+ years back - will find actual boundary
+    "end_date": "2025-08-05",    # Today - start from here and work backwards
     
     # Time interval for data
     "interval": "1m",  # Options: 1m, 5m, 15m, 30m, 1h, 4h
@@ -21,7 +21,7 @@ DOWNLOAD_CONFIG = {
     "max_concurrent": 12,  # Increased max - adaptive system will find optimal level
     
     # Theta Terminal URL
-    "base_url": "http://localhost:25510",
+    "base_url": "http://localhost:25503",
     
     # Smart download settings
     "work_backwards": True,  # Start from end_date and work backwards

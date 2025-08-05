@@ -104,7 +104,7 @@ class MarketCalendar:
                 days.append(current.strftime('%Y-%m-%d'))
             current += timedelta(days=1)
         
-        logger.warning("Using fallback day calculation (weekends only filtered)")
+        logger.info("Using fallback day calculation (weekends only filtered)")
         return days
     
     def mark_no_data_date(self, date: str):

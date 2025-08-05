@@ -24,33 +24,32 @@ from config import DOWNLOAD_CONFIG, OUTPUT_CONFIG
 from market_calendar import MarketCalendar
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('theta_downloader.log'),
-        logging.StreamHandler()
-    ]
-)
+import sys
+
+# Create file handler
+file_handler = logging.FileHandler('theta_downloader.log')
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Create console handler with higher threshold to avoid interfering with progress bar
+console_handler = logging.StreamHandler(sys.stderr)  # Use stderr instead of stdout
+console_handler.setLevel(logging.WARNING)  # Only show warnings and errors during progress
+console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Setup logger (file only - no console output during progress display)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+# console_handler removed to keep progress display clean
+
 import json
 import time
 import sys
 import psutil
 import asyncio
 from typing import List, Dict, Optional, Set
-import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bulk_downloader.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
 
 class AdaptiveConcurrencyManager:
@@ -231,21 +230,57 @@ class AdaptiveConcurrencyManager:
 
 
 class ProgressTracker:
-    """Real-time progress tracker with ETA calculation."""
+    """Real-time progress tracker with ETA calculation and download speed monitoring."""
     
     def __init__(self, total_tasks: int):
         self.total_tasks = total_tasks
         self.completed_tasks = 0
         self.start_time = time.time()
-        self.last_update = self.start_time
+        self.recent_downloads = []  # Track recent downloads for speed calculation
+        self._console_handler = None
+        self._original_level = None
         
-    def update(self, increment: int = 1):
-        """Update progress and display current status."""
+        # Show initial progress immediately
+        self.update(0)  # Show initial state
+        
+    def __enter__(self):
+        """Enter context manager - suppress console logging during progress display."""
+        # Find and temporarily disable console logging to avoid interfering with progress bar
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and hasattr(handler, 'stream'):
+                if handler.stream == sys.stderr:
+                    self._console_handler = handler
+                    self._original_level = handler.level
+                    handler.setLevel(logging.CRITICAL)  # Only show critical errors
+                    break
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager - restore console logging."""
+        if self._console_handler and self._original_level is not None:
+            self._console_handler.setLevel(self._original_level)
+            # Add a newline to separate from progress bar
+            print()  # This ensures clean separation
+        
+    def update(self, increment: int = 1, file_size_mb: float = 0):
+        """Update progress and display current status with download speed."""
         self.completed_tasks += increment
         current_time = time.time()
         
+        # Track downloads for speed calculation
+        if file_size_mb > 0:
+            self.recent_downloads.append({
+                'time': current_time,
+                'size_mb': file_size_mb
+            })
+        
+        # Keep only recent downloads (last 10 files or 60 seconds)
+        cutoff_time = current_time - 60
+        self.recent_downloads = [d for d in self.recent_downloads 
+                               if d['time'] > cutoff_time][-10:]
+        
         # Calculate progress percentage
-        progress_percent = (self.completed_tasks / self.total_tasks) * 100
+        progress_percent = (self.completed_tasks / self.total_tasks) * 100 if self.total_tasks > 0 else 0
         
         # Calculate ETA
         elapsed_time = current_time - self.start_time
@@ -257,19 +292,61 @@ class ProgressTracker:
         else:
             eta_str = "Calculating..."
         
-        # Create progress bar
-        bar_length = 30
-        filled_length = int(bar_length * self.completed_tasks // self.total_tasks)
+        # Calculate download speed
+        speed_str = self._calculate_speed()
+        
+        # Create progress bar (20 characters for compactness)
+        bar_length = 20
+        filled_length = int(bar_length * self.completed_tasks // self.total_tasks) if self.total_tasks > 0 else 0
         bar = '█' * filled_length + '░' * (bar_length - filled_length)
         
-        # Display progress (overwrite previous line)
-        progress_line = f"\r📊 Progress: [{bar}] {progress_percent:.1f}% ({self.completed_tasks}/{self.total_tasks}) | ETA: {eta_str}"
+        # Single clean progress line
+        progress_line = f"\r📈 [{bar}] {progress_percent:.1f}% ({self.completed_tasks:,}/{self.total_tasks:,}) | {speed_str} | ETA: {eta_str}"
+        sys.stdout.write('\r' + ' ' * 100 + '\r')  # Clear any previous content
         sys.stdout.write(progress_line)
         sys.stdout.flush()
         
         # Add newline when complete
         if self.completed_tasks >= self.total_tasks:
             print()  # New line after completion
+    
+    def _calculate_speed(self) -> str:
+        """Calculate current download speed from recent downloads."""
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        
+        # Calculate files per second (use a minimum elapsed time to avoid division issues)
+        if elapsed_time > 1 and self.completed_tasks > 0:  # Wait at least 1 second
+            files_per_sec = self.completed_tasks / elapsed_time
+            if files_per_sec >= 1:
+                files_rate = f"{files_per_sec:.1f} files/s"
+            elif files_per_sec >= 0.1:
+                files_rate = f"{files_per_sec:.2f} files/s"
+            else:
+                files_per_min = files_per_sec * 60
+                files_rate = f"{files_per_min:.1f} files/min"
+        else:
+            files_rate = "Starting..."
+        
+        # Filter recent downloads (last 60 seconds) for data speed
+        recent = [d for d in self.recent_downloads if current_time - d['time'] <= 60]
+        
+        if len(recent) < 2:
+            return files_rate
+        
+        # Calculate total data and time span
+        total_mb = sum(d['size_mb'] for d in recent if d['size_mb'] > 0)
+        time_span = recent[-1]['time'] - recent[0]['time']
+        
+        if time_span > 0 and total_mb > 0:
+            speed_mbps = total_mb / time_span
+            if speed_mbps >= 1:
+                data_rate = f"{speed_mbps:.1f} MB/s"
+            else:
+                data_rate = f"{speed_mbps*1024:.0f} KB/s"
+            return f"{files_rate} • {data_rate}"
+        
+        return files_rate
     
     def _format_time(self, seconds: float) -> str:
         """Format seconds into human-readable time."""
@@ -384,13 +461,16 @@ class ThetaBulkDownloader:
                     history = json.load(f)
                     history_files = set(history.get('downloaded_files', []))
                     
-                # Only keep files that both exist in history AND on disk
-                self.downloaded_files = existing_files.intersection(history_files)
-                
-                # If there's a mismatch, update the history
+                # If there's a mismatch, use all validated files on disk
                 if existing_files != history_files:
                     logger.info(f"Updating download history to match existing files")
+                    logger.info(f"  History had: {len(history_files)} files")
+                    logger.info(f"  Disk has: {len(existing_files)} files")
+                    self.downloaded_files = existing_files
                     self._save_download_history()
+                else:
+                    # Files match, use either set
+                    self.downloaded_files = existing_files
                     
             except Exception as e:
                 logger.warning(f"Could not load download history: {e}")
@@ -719,12 +799,24 @@ class ThetaBulkDownloader:
         
         # Update progress if tracker is provided
         if progress_tracker:
-            progress_tracker.update()
+            # Get file size if download was successful
+            file_size_mb = 0
+            if result:
+                try:
+                    output_file = self.get_output_filename(symbol, date, interval)
+                    if output_file.exists():
+                        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+                except Exception as e:
+                    logger.debug(f"Error getting file size for {symbol} {date}: {e}")
+            
+            # Always update progress, even for failed downloads (with 0 file size)
+            progress_tracker.update(file_size_mb=file_size_mb)
         
         return result
     
     async def download_multiple_symbols(self, symbols: List[str], start_date: str, 
-                                      end_date: str, interval: str = "1m") -> Dict[str, Dict[str, bool]]:
+                                      end_date: str, interval: str = "1m", 
+                                      existing_progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, Dict[str, bool]]:
         """
         Download options data for multiple symbols across a date range with intelligent resume.
         
@@ -742,7 +834,7 @@ class ThetaBulkDownloader:
         # Check if we should work backwards
         if DOWNLOAD_CONFIG.get('work_backwards', False):
             return await self.download_backwards_with_boundary_detection(
-                symbols, start_date, end_date, interval
+                symbols, start_date, end_date, interval, existing_progress_tracker
             )
         
         logger.info(f"Starting bulk download for {len(symbols)} symbols: {', '.join(symbols)}")
@@ -785,46 +877,80 @@ class ThetaBulkDownloader:
             print(f"🔄 Resuming from {resume_status['completion_percent']:.1f}% completion")
         print()
         
-        # Initialize progress tracker for remaining files
-        progress_tracker = ProgressTracker(total_tasks)
-        
-        # Group files by symbol for organized downloading
-        all_results = {}
-        for symbol in symbols:
-            symbol_files = [f for f in files_to_download if f['symbol'] == symbol]
-            
-            if not symbol_files:
-                # All files for this symbol already downloaded
-                symbol_results = {}
-                for file_info in resume_status['files']:
-                    if file_info['symbol'] == symbol:
-                        symbol_results[file_info['date']] = True
+        # Use existing progress tracker or create new one
+        if existing_progress_tracker:
+            progress_tracker = existing_progress_tracker
+            # Group files by symbol for organized downloading
+            all_results = {}
+            for symbol in symbols:
+                symbol_files = [f for f in files_to_download if f['symbol'] == symbol]
+                
+                if not symbol_files:
+                    # All files for this symbol already downloaded
+                    symbol_results = {}
+                    for file_info in resume_status['files']:
+                        if file_info['symbol'] == symbol:
+                            symbol_results[file_info['date']] = True
+                    all_results[symbol] = symbol_results
+                    continue
+                
+                # Download missing files for this symbol
+                symbol_dates = [f['date'] for f in symbol_files]
+                min_date = min(symbol_dates)
+                max_date = max(symbol_dates)
+                
+                symbol_results = await self.download_symbol_range(
+                    symbol, min_date, max_date, interval, progress_tracker, files_to_download
+                )
                 all_results[symbol] = symbol_results
-                continue
+                
+                # Small delay between symbols to be respectful
+                if len(symbols) > 1:
+                    await asyncio.sleep(1)
+                    
+            # Don't print newline here - let main() handle it
+            self._save_download_history()
+            return all_results
+        else:
+            # Fallback: create local progress tracker
+            with ProgressTracker(total_tasks) as progress_tracker:
+                # Group files by symbol for organized downloading
+                all_results = {}
+                for symbol in symbols:
+                    symbol_files = [f for f in files_to_download if f['symbol'] == symbol]
+                    
+                    if not symbol_files:
+                        # All files for this symbol already downloaded
+                        symbol_results = {}
+                        for file_info in resume_status['files']:
+                            if file_info['symbol'] == symbol:
+                                symbol_results[file_info['date']] = True
+                        all_results[symbol] = symbol_results
+                        continue
+                    
+                    # Download missing files for this symbol
+                    symbol_dates = [f['date'] for f in symbol_files]
+                    min_date = min(symbol_dates)
+                    max_date = max(symbol_dates)
+                    
+                    symbol_results = await self.download_symbol_range(
+                        symbol, min_date, max_date, interval, progress_tracker, files_to_download
+                    )
+                    all_results[symbol] = symbol_results
+                    
+                    # Small delay between symbols to be respectful
+                    if len(symbols) > 1:
+                        await asyncio.sleep(1)
             
-            # Download missing files for this symbol
-            symbol_dates = [f['date'] for f in symbol_files]
-            min_date = min(symbol_dates)
-            max_date = max(symbol_dates)
+            # Context manager handles progress cleanup
+            print()
             
-            symbol_results = await self.download_symbol_range(
-                symbol, min_date, max_date, interval, progress_tracker, files_to_download
-            )
-            all_results[symbol] = symbol_results
-            
-            # Small delay between symbols to be respectful
-            if len(symbols) > 1:
-                await asyncio.sleep(1)
-        
-        # Ensure progress is complete
-        progress_tracker.finish()
-        print()
-        
-        self._save_download_history()
-        return all_results
+            self._save_download_history()
+            return all_results
     
     async def download_backwards_with_boundary_detection(self, symbols: List[str], start_date: str, 
-                                                       end_date: str, interval: str = "1m") -> Dict[str, Dict[str, bool]]:
+                                                       end_date: str, interval: str = "1m",
+                                                       existing_progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, Dict[str, bool]]:
         """
         Download data working backwards from end_date, stopping when we hit data boundary.
         
@@ -843,10 +969,6 @@ class ThetaBulkDownloader:
         chunk_size = DOWNLOAD_CONFIG.get('chunk_size', 50)
         
         logger.info(f"Starting BACKWARDS download for {len(symbols)} symbols: {', '.join(symbols)}")
-        print(f"🔄 Working backwards from {end_date} to find data coverage boundary")
-        print(f"   Will stop after {max_consecutive_failures} consecutive failures")
-        print(f"   Processing in chunks of {chunk_size} trading days")
-        print()
         
         # Get all trading days in the range
         all_trading_days = self.market_calendar.get_trading_days(start_date, end_date)
@@ -855,86 +977,173 @@ class ThetaBulkDownloader:
         
         all_results = {}
         for symbol in symbols:
-            print(f"📊 Processing {symbol}...")
             symbol_results = {}
             consecutive_failures = 0
             successful_downloads = 0
             
-            # Initialize overall progress tracker for the entire job
+            # Use existing progress tracker or create new one for the entire job
             total_days = len(all_trading_days)
-            overall_progress = ProgressTracker(total_days)
-            print(f"   Total trading days to process: {total_days}")
+            logger.info(f"Total trading days to process: {total_days}")
             print()
             
-            # Process in chunks to detect boundary faster
-            for chunk_start in range(0, len(all_trading_days), chunk_size):
-                chunk_end = min(chunk_start + chunk_size, len(all_trading_days))
-                chunk_dates = all_trading_days[chunk_start:chunk_end]
-                
-                print(f"   Chunk {chunk_start//chunk_size + 1}: {chunk_dates[0]} to {chunk_dates[-1]} ({len(chunk_dates)} days)")
-                
-                # Track chunk failures but don't show chunk progress bar
-                chunk_failures = 0
-                
-                for date in chunk_dates:
-                    file_key = self.generate_file_key(symbol, date, interval)
+            if existing_progress_tracker:
+                overall_progress = existing_progress_tracker
+                # Process in chunks to detect boundary faster
+                for chunk_start in range(0, len(all_trading_days), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(all_trading_days))
+                    chunk_dates = all_trading_days[chunk_start:chunk_end]
                     
-                    # Skip if already downloaded
-                    if file_key in self.downloaded_files:
-                        symbol_results[date] = True
-                        overall_progress.update()  # Update overall progress
-                        continue
+                    # Process chunk without creating sub-progress tracker
+                    chunk_failures = 0
                     
-                    # Download this date (removed individual "Trying" messages to keep output clean)
-                    success = await self.download_options_data(symbol, date, interval)
-                    symbol_results[date] = success
-                    overall_progress.update()  # Update overall progress
-                    
-                    if success:
-                        successful_downloads += 1
-                        consecutive_failures = 0
-                    else:
-                        consecutive_failures += 1
-                        chunk_failures += 1
+                    for date in chunk_dates:
+                        file_key = self.generate_file_key(symbol, date, interval)
                         
-                        # Check if we should stop
-                        if consecutive_failures >= max_consecutive_failures:
-                            overall_progress.finish()
-                            print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
-                            print(f"   Data boundary likely reached around {date}")
-                            print(f"   Successfully downloaded {successful_downloads} files")
+                        # Skip if already downloaded
+                        if file_key in self.downloaded_files:
+                            symbol_results[date] = True
+                            overall_progress.update(file_size_mb=0)  # Update overall progress with no download
+                            continue
+                        
+                        # Download this date
+                        success = await self.download_options_data(symbol, date, interval)
+                        symbol_results[date] = success
+                        
+                        # Update progress with file size if successful
+                        file_size_mb = 0
+                        if success:
+                            try:
+                                output_file = self.get_output_filename(symbol, date, interval)
+                                if output_file.exists():
+                                    file_size_mb = output_file.stat().st_size / (1024 * 1024)
+                            except:
+                                pass
+                        
+                        overall_progress.update(file_size_mb=file_size_mb)  # Update overall progress with file size
+                        
+                        if success:
+                            successful_downloads += 1
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            chunk_failures += 1
+                            
+                            # Check if we should stop
+                            if consecutive_failures >= max_consecutive_failures:
+                                print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
+                                print(f"   Data boundary likely reached around {date}")
+                                print(f"   Successfully downloaded {successful_downloads} files")
+                                self._print_adaptive_status()
+                                return {symbol: symbol_results}
+                        
+                        # Small delay to be respectful
+                        await asyncio.sleep(0.1)
+                        
+                        # Periodic status update for adaptive concurrency
+                        if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
                             self._print_adaptive_status()
+                
+                    # If we hit the boundary in this chunk, stop processing this symbol
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    
+                    # If the entire chunk failed, we're likely past the boundary
+                    if chunk_failures == len(chunk_dates):
+                        consecutive_failures += chunk_failures
+                        print(f"\n🛑 Entire chunk failed for {symbol}")
+                        print(f"   Data boundary likely reached around {chunk_dates[-1]}")
+                        logger.info(f"Successfully downloaded {successful_downloads} files")
+                        return {symbol: symbol_results}
+                    
+                    # Log chunk completion to file only  
+                    logger.debug(f"Chunk complete: {chunk_failures} failures in this chunk")
+                    
+                    # Small delay between chunks
+                    await asyncio.sleep(1)
+                
+                # Progress tracker managed externally, don't handle cleanup here
+                all_results[symbol] = symbol_results
+                
+            else:
+                # Fallback: create local progress tracker
+                with ProgressTracker(total_days) as overall_progress:
+                    # Process in chunks to detect boundary faster
+                    for chunk_start in range(0, len(all_trading_days), chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, len(all_trading_days))
+                        chunk_dates = all_trading_days[chunk_start:chunk_end]
+                        
+                        print(f"   Chunk {chunk_start//chunk_size + 1}: {chunk_dates[0]} to {chunk_dates[-1]} ({len(chunk_dates)} days)")
+                        
+                        # Process chunk without creating sub-progress tracker
+                        chunk_failures = 0
+                        
+                        for date in chunk_dates:
+                            file_key = self.generate_file_key(symbol, date, interval)
+                            
+                            # Skip if already downloaded
+                            if file_key in self.downloaded_files:
+                                symbol_results[date] = True
+                                overall_progress.update(file_size_mb=0)  # Update overall progress with no download
+                                continue
+                            
+                            # Download this date
+                            success = await self.download_options_data(symbol, date, interval)
+                            symbol_results[date] = success
+                            
+                            # Update progress with file size if successful
+                            file_size_mb = 0
+                            if success:
+                                try:
+                                    output_file = self.get_output_filename(symbol, date, interval)
+                                    if output_file.exists():
+                                        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+                                except:
+                                    pass
+                            
+                            overall_progress.update(file_size_mb=file_size_mb)  # Update overall progress with file size
+                            
+                            if success:
+                                successful_downloads += 1
+                                consecutive_failures = 0
+                            else:
+                                consecutive_failures += 1
+                                chunk_failures += 1
+                                
+                                # Check if we should stop
+                                if consecutive_failures >= max_consecutive_failures:
+                                    print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
+                                    print(f"   Data boundary likely reached around {date}")
+                                    print(f"   Successfully downloaded {successful_downloads} files")
+                                    self._print_adaptive_status()
+                                    return {symbol: symbol_results}
+                            
+                            # Small delay to be respectful
+                            await asyncio.sleep(0.1)
+                            
+                            # Periodic status update for adaptive concurrency
+                            if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
+                                self._print_adaptive_status()
+                    
+                        # If we hit the boundary in this chunk, stop processing this symbol
+                        if consecutive_failures >= max_consecutive_failures:
+                            break
+                        
+                        # If the entire chunk failed, we're likely past the boundary
+                        if chunk_failures == len(chunk_dates):
+                            consecutive_failures += chunk_failures
+                            print(f"\n🛑 Entire chunk failed for {symbol}")
+                            logger.info(f"Data boundary likely reached around {chunk_dates[-1]}")
+                            logger.info(f"Successfully downloaded {successful_downloads} files")
                             return {symbol: symbol_results}
-                    
-                    # Small delay to be respectful
-                    await asyncio.sleep(0.1)
-                    
-                    # Periodic status update for adaptive concurrency
-                    if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
-                        self._print_adaptive_status()
+                        
+                        # Log chunk completion to file only
+                        logger.debug(f"Chunk complete: {chunk_failures} failures in this chunk")
+                        
+                        # Small delay between chunks
+                        await asyncio.sleep(1)
                 
-                # If we hit the boundary in this chunk, stop processing this symbol
-                if consecutive_failures >= max_consecutive_failures:
-                    break
-                
-                # If the entire chunk failed, we're likely past the boundary
-                if chunk_failures == len(chunk_dates):
-                    consecutive_failures += chunk_failures
-                    overall_progress.finish()
-                    print(f"\n🛑 Entire chunk failed for {symbol}")
-                    print(f"   Data boundary likely reached around {chunk_dates[-1]}")
-                    print(f"   Successfully downloaded {successful_downloads} files")
-                    return {symbol: symbol_results}
-                
-                # Show chunk summary (but progress bar shows overall progress)
-                print(f"   Chunk complete: {chunk_failures} failures in this chunk")
-                
-                # Small delay between chunks
-                await asyncio.sleep(1)
-            
-            # Ensure progress is complete
-            overall_progress.finish()
-            all_results[symbol] = symbol_results
+                # Context manager automatically handles progress cleanup
+                all_results[symbol] = symbol_results
             
             print(f"✅ {symbol} complete: {successful_downloads} files downloaded")
             print(f"   Data coverage appears to start around: {self._find_earliest_success(symbol_results)}")
@@ -1029,11 +1238,7 @@ async def main():
         )
 async def main():
     """Main function to run the bulk downloader."""
-    print("=" * 60)
-    print("THETA DATA BULK OPTIONS DOWNLOADER")
-    print("=" * 60)
-    
-    # Calculate organized output directory
+    # Calculate organized output directory for logging setup
     from config import get_organized_output_dir
     if len(DOWNLOAD_CONFIG['symbols']) == 1:
         organized_dir = get_organized_output_dir(
@@ -1046,15 +1251,6 @@ async def main():
         date_range = f"{DOWNLOAD_CONFIG['start_date']}_to_{DOWNLOAD_CONFIG['end_date']}"
         organized_dir = f"{OUTPUT_CONFIG['options_base_dir']}/multi_symbol_{date_range}"
     
-    # Display configuration
-    print(f"📊 Configuration:")
-    print(f"   Symbols: {', '.join(DOWNLOAD_CONFIG['symbols'])}")
-    print(f"   Date Range: {DOWNLOAD_CONFIG['start_date']} to {DOWNLOAD_CONFIG['end_date']}")
-    print(f"   Interval: {DOWNLOAD_CONFIG['interval']}")
-    print(f"   Max Concurrent: {DOWNLOAD_CONFIG['max_concurrent']}")
-    print(f"   Data Storage: {organized_dir}")
-    print()
-    
     try:
         # Create downloader instance with organized folder structure
         async with ThetaBulkDownloader(
@@ -1064,7 +1260,7 @@ async def main():
             end_date=DOWNLOAD_CONFIG['end_date'],
             adaptive_concurrency=DOWNLOAD_CONFIG.get('adaptive_concurrency', True)
         ) as downloader:
-            # Show resume status
+            # Show resume status and create global progress tracker
             resume_status = downloader.get_resume_status(
                 DOWNLOAD_CONFIG['symbols'],
                 DOWNLOAD_CONFIG['start_date'],
@@ -1072,24 +1268,30 @@ async def main():
                 DOWNLOAD_CONFIG['interval']
             )
             
-            if resume_status['downloaded_files'] > 0:
-                print(f"📁 Found {resume_status['downloaded_files']} existing files")
-                if resume_status['can_resume']:
-                    print(f"   Progress: {resume_status['completion_percent']:.1f}% complete")
-                    print(f"   Remaining: {resume_status['remaining_files']} files to download")
-                elif resume_status['downloaded_files'] == resume_status['total_files']:
-                    print(f"   Status: All files complete! ✅")
-                print()
+            # Create global progress tracker immediately with total files
+            total_files = resume_status['total_files']
+            completed_files = resume_status['downloaded_files']
             
-            # Download data
-            print("🚀 Starting download...")
+            # Show essential info
+            symbol = DOWNLOAD_CONFIG['symbols'][0]
+            print(f"🎯 {symbol}: {DOWNLOAD_CONFIG['start_date']} to {DOWNLOAD_CONFIG['end_date']} ({total_files:,} days)")
             
-            results = await downloader.download_multiple_symbols(
-                DOWNLOAD_CONFIG['symbols'], 
-                DOWNLOAD_CONFIG['start_date'], 
-                DOWNLOAD_CONFIG['end_date'], 
-                DOWNLOAD_CONFIG['interval']
-            )
+            # Use context manager for clean progress display
+            with ProgressTracker(total_files) as progress_tracker:
+                # Set initial progress to match existing files
+                if completed_files > 0:
+                    progress_tracker.completed_tasks = completed_files
+                    # Update progress bar to show current status immediately
+                    progress_tracker.update(increment=0)  # Refresh display with current counts
+                
+                # Start download (progress bar will handle all visual feedback)
+                results = await downloader.download_multiple_symbols(
+                    DOWNLOAD_CONFIG['symbols'], 
+                    DOWNLOAD_CONFIG['start_date'], 
+                    DOWNLOAD_CONFIG['end_date'], 
+                    DOWNLOAD_CONFIG['interval'],
+                    existing_progress_tracker=progress_tracker
+                )
             
             # Show final results
             final_summary = downloader.get_download_summary()
