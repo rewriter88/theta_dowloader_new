@@ -26,9 +26,11 @@ DOWNLOAD_CONFIG = {
 
 # Output Configuration
 OUTPUT_CONFIG = {
-    # Directory where data will be stored on external SSD
-    "results_dir": "/Volumes/SSD 4TB/Theta_Data",
-    "options_dir": "/Volumes/SSD 4TB/Theta_Data/options",
+    # Base directory where data will be stored on external SSD
+    "base_dir": "/Volumes/SSD 4TB/Theta_Data",
+    
+    # Directory structure: base_dir/options/SYMBOL/YYYY-MM-DD_to_YYYY-MM-DD/
+    "options_base_dir": "/Volumes/SSD 4TB/Theta_Data/options",
     
     # File naming format
     "filename_format": "{symbol}_options_{date}_{interval}.csv",
@@ -52,6 +54,13 @@ def get_recent_trading_days(days=4):
         current -= timedelta(days=1)
     
     return dates[-1], dates[0]  # start_date, end_date
+
+def get_organized_output_dir(symbol, start_date, end_date):
+    """Generate organized output directory path."""
+    # Create path: base_dir/options/SYMBOL/YYYY-MM-DD_to_YYYY-MM-DD/
+    date_range = f"{start_date}_to_{end_date}"
+    organized_path = f"{OUTPUT_CONFIG['options_base_dir']}/{symbol}/{date_range}"
+    return organized_path
 
 # Uncomment to use automatic recent trading days instead of fixed dates
 # DOWNLOAD_CONFIG["start_date"], DOWNLOAD_CONFIG["end_date"] = get_recent_trading_days(4)

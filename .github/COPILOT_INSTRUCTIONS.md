@@ -8,3 +8,4 @@ This program is for downloading data for real trading. Fake data, estimations, o
 
 **ONLY use real data from Theta Data API calls.**
 
+When I say commit I always mean local and github

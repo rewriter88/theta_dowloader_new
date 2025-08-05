@@ -121,26 +121,40 @@ class ThetaBulkDownloader:
     - Resumable downloads with duplicate detection
     """
     
-    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 4, output_dir: str = None):
+    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 4, 
+                 symbols: List[str] = None, start_date: str = None, end_date: str = None, output_dir: str = None):
         """
         Initialize the bulk downloader.
         
         Args:
             base_url: Theta Terminal base URL
             max_concurrent: Maximum concurrent connections (Standard = 4)
-            output_dir: Output directory for storing data (uses config if None)
+            symbols: List of symbols for organized folder structure
+            start_date: Start date for organized folder structure
+            end_date: End date for organized folder structure
+            output_dir: Output directory for storing data (uses organized structure if None)
         """
         self.base_url = base_url
         self.max_concurrent = max_concurrent
         self.session = None
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
-        # Use output directory from config or default
-        if output_dir is None:
+        # Use organized directory structure
+        if output_dir is None and symbols and start_date and end_date:
+            from config import get_organized_output_dir
+            # For single symbol, use organized structure
+            if len(symbols) == 1:
+                output_dir = get_organized_output_dir(symbols[0], start_date, end_date)
+            else:
+                # For multiple symbols, use base options directory
+                from config import OUTPUT_CONFIG
+                output_dir = f"{OUTPUT_CONFIG['options_base_dir']}/multi_symbol_{start_date}_to_{end_date}"
+        elif output_dir is None:
+            # Fallback to base options directory
             from config import OUTPUT_CONFIG
-            output_dir = OUTPUT_CONFIG['options_dir']
+            output_dir = OUTPUT_CONFIG['options_base_dir']
         
-        # Create results directory structure
+        # Create output directory structure
         self.options_dir = Path(output_dir)
         self.options_dir.mkdir(parents=True, exist_ok=True)
         
@@ -621,20 +635,35 @@ async def main():
     print("THETA DATA BULK OPTIONS DOWNLOADER")
     print("=" * 60)
     
+    # Calculate organized output directory
+    from config import get_organized_output_dir
+    if len(DOWNLOAD_CONFIG['symbols']) == 1:
+        organized_dir = get_organized_output_dir(
+            DOWNLOAD_CONFIG['symbols'][0], 
+            DOWNLOAD_CONFIG['start_date'], 
+            DOWNLOAD_CONFIG['end_date']
+        )
+    else:
+        from config import OUTPUT_CONFIG
+        date_range = f"{DOWNLOAD_CONFIG['start_date']}_to_{DOWNLOAD_CONFIG['end_date']}"
+        organized_dir = f"{OUTPUT_CONFIG['options_base_dir']}/multi_symbol_{date_range}"
+    
     # Display configuration
     print(f"📊 Configuration:")
     print(f"   Symbols: {', '.join(DOWNLOAD_CONFIG['symbols'])}")
     print(f"   Date Range: {DOWNLOAD_CONFIG['start_date']} to {DOWNLOAD_CONFIG['end_date']}")
     print(f"   Interval: {DOWNLOAD_CONFIG['interval']}")
     print(f"   Max Concurrent: {DOWNLOAD_CONFIG['max_concurrent']}")
-    print(f"   Data Storage: {OUTPUT_CONFIG['options_dir']}")
+    print(f"   Data Storage: {organized_dir}")
     print()
     
     try:
-        # Create downloader instance and use as async context manager
+        # Create downloader instance with organized folder structure
         async with ThetaBulkDownloader(
             max_concurrent=DOWNLOAD_CONFIG['max_concurrent'],
-            output_dir=OUTPUT_CONFIG['options_dir']
+            symbols=DOWNLOAD_CONFIG['symbols'],
+            start_date=DOWNLOAD_CONFIG['start_date'],
+            end_date=DOWNLOAD_CONFIG['end_date']
         ) as downloader:
             # Show resume status
             resume_status = downloader.get_resume_status(
@@ -665,7 +694,7 @@ async def main():
             
             # Show final results
             final_summary = downloader.get_download_summary()
-            print(f"✅ Download complete! Data stored in: {OUTPUT_CONFIG['options_dir']}")
+            print(f"✅ Download complete! Data stored in: {organized_dir}")
             print(f"📊 Final Summary:")
             print(f"   Total Files: {final_summary['total_files']}")
             print(f"   Total Size: {final_summary['total_size_bytes']:,} bytes")
