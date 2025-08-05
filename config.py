@@ -10,23 +10,26 @@ DOWNLOAD_CONFIG = {
     # Symbols to download (QQQ only as requested)
     "symbols": ["QQQ"],
     
-    # Date range for download (Working backwards from last Friday)
-    "start_date": "2019-01-01",  # Conservative start date - we'll work backwards from end_date
+    # Date range for download (8 YEARS of QQQ historical data!)
+    "start_date": "2016-08-04",  # 8 years back - will find actual boundary
     "end_date": "2024-08-02",    # Last Friday - start from here and work backwards
     
     # Time interval for data
     "interval": "1m",  # Options: 1m, 5m, 15m, 30m, 1h, 4h
     
-    # Maximum concurrent connections (Standard subscription = 8)
-    "max_concurrent": 8,
+    # Maximum concurrent connections (adaptive system will scale intelligently)
+    "max_concurrent": 12,  # Increased max - adaptive system will find optimal level
     
     # Theta Terminal URL
-    "base_url": "http://localhost:25503",
+    "base_url": "http://localhost:25510",
     
     # Smart download settings
     "work_backwards": True,  # Start from end_date and work backwards
     "max_consecutive_failures": 20,  # Stop if we get this many consecutive 472 errors
-    "chunk_size": 50  # Download in chunks to detect boundary faster
+    "chunk_size": 50,  # Download in chunks to detect boundary faster
+    
+    # Adaptive Concurrency Settings
+    "adaptive_concurrency": True,  # Enable intelligent concurrency scaling
 }
 
 # Output Configuration

@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 import json
 import time
 import sys
+import psutil
+import asyncio
 from typing import List, Dict, Optional, Set
 import logging
 
@@ -49,6 +51,183 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+class AdaptiveConcurrencyManager:
+    """
+    Intelligent concurrency management that adapts to system resources.
+    
+    Features:
+    - Starts with conservative concurrency
+    - Monitors memory usage, download speed, and error rates
+    - Automatically scales up when system can handle more
+    - Backs off when hitting resource limits
+    - Prevents system overload and crashes
+    """
+    
+    def __init__(self, initial_concurrency: int = 2, max_concurrency: int = 16):
+        self.current_concurrency = initial_concurrency
+        self.max_concurrency = max_concurrency
+        self.min_concurrency = 1
+        
+        # Performance tracking
+        self.download_times = []
+        self.memory_usage_history = []
+        self.error_count = 0
+        self.success_count = 0
+        self.last_adjustment_time = time.time()
+        
+        # Thresholds for scaling decisions
+        self.memory_threshold = 85  # Scale down if memory > 85%
+        self.error_rate_threshold = 0.2  # Scale down if error rate > 20%
+        self.adjustment_interval = 30  # Seconds between adjustments
+        self.performance_window = 10  # Number of downloads to average
+        
+        # System info
+        self.total_memory = psutil.virtual_memory().total
+        self.cpu_count = psutil.cpu_count()
+        
+        logger.info(f"🧠 Adaptive Concurrency Manager initialized")
+        logger.info(f"   System: {self.total_memory / (1024**3):.1f}GB RAM, {self.cpu_count} CPU cores")
+        logger.info(f"   Starting concurrency: {self.current_concurrency}")
+        logger.info(f"   Max concurrency: {self.max_concurrency}")
+    
+    def get_current_concurrency(self) -> int:
+        """Get current concurrency level."""
+        return self.current_concurrency
+    
+    def record_download(self, success: bool, download_time: float, file_size_mb: float):
+        """Record the result of a download attempt."""
+        if success:
+            self.success_count += 1
+            if download_time > 0:
+                # Calculate download speed (MB/s)
+                speed = file_size_mb / download_time if download_time > 0 else 0
+                self.download_times.append({
+                    'time': download_time,
+                    'speed': speed,
+                    'size': file_size_mb,
+                    'timestamp': time.time()
+                })
+        else:
+            self.error_count += 1
+        
+        # Keep only recent history
+        if len(self.download_times) > self.performance_window:
+            self.download_times = self.download_times[-self.performance_window:]
+        
+        # Record memory usage
+        memory_percent = psutil.virtual_memory().percent
+        self.memory_usage_history.append(memory_percent)
+        if len(self.memory_usage_history) > self.performance_window:
+            self.memory_usage_history = self.memory_usage_history[-self.performance_window:]
+        
+        # Check if we should adjust concurrency
+        self._maybe_adjust_concurrency()
+    
+    def _maybe_adjust_concurrency(self):
+        """Decide whether to adjust concurrency based on current performance."""
+        current_time = time.time()
+        if current_time - self.last_adjustment_time < self.adjustment_interval:
+            return  # Too soon to adjust
+        
+        if len(self.download_times) < 3:
+            return  # Not enough data
+        
+        # Calculate current metrics
+        total_downloads = self.success_count + self.error_count
+        error_rate = self.error_count / total_downloads if total_downloads > 0 else 0
+        avg_memory = sum(self.memory_usage_history) / len(self.memory_usage_history)
+        avg_speed = sum(d['speed'] for d in self.download_times) / len(self.download_times)
+        
+        old_concurrency = self.current_concurrency
+        
+        # Decision logic
+        should_scale_down = (
+            avg_memory > self.memory_threshold or
+            error_rate > self.error_rate_threshold or
+            self._is_performance_degrading()
+        )
+        
+        should_scale_up = (
+            avg_memory < 70 and  # Plenty of memory available
+            error_rate < 0.05 and  # Very low error rate
+            self.current_concurrency < self.max_concurrency and
+            self._is_performance_stable()
+        )
+        
+        if should_scale_down and self.current_concurrency > self.min_concurrency:
+            self.current_concurrency = max(self.min_concurrency, self.current_concurrency - 1)
+            logger.info(f"🔽 Scaling DOWN concurrency: {old_concurrency} → {self.current_concurrency}")
+            logger.info(f"   Reason: Memory={avg_memory:.1f}%, ErrorRate={error_rate:.1%}, Performance issues")
+            
+        elif should_scale_up:
+            self.current_concurrency = min(self.max_concurrency, self.current_concurrency + 1)
+            logger.info(f"🔼 Scaling UP concurrency: {old_concurrency} → {self.current_concurrency}")
+            logger.info(f"   Reason: Memory={avg_memory:.1f}%, ErrorRate={error_rate:.1%}, Good performance")
+        
+        if old_concurrency != self.current_concurrency:
+            self.last_adjustment_time = current_time
+            # Reset some counters after adjustment
+            self.error_count = max(0, self.error_count - 2)
+            self.success_count = max(0, self.success_count - 5)
+    
+    def _is_performance_degrading(self) -> bool:
+        """Check if performance is getting worse."""
+        if len(self.download_times) < 5:
+            return False
+        
+        # Compare recent speeds with earlier speeds
+        recent_speeds = [d['speed'] for d in self.download_times[-3:]]
+        earlier_speeds = [d['speed'] for d in self.download_times[-6:-3]]
+        
+        if not recent_speeds or not earlier_speeds:
+            return False
+        
+        recent_avg = sum(recent_speeds) / len(recent_speeds)
+        earlier_avg = sum(earlier_speeds) / len(earlier_speeds)
+        
+        # Performance is degrading if recent speed is significantly slower
+        return recent_avg < earlier_avg * 0.7  # 30% slower
+    
+    def _is_performance_stable(self) -> bool:
+        """Check if performance is stable and good."""
+        if len(self.download_times) < 3:
+            return False
+        
+        # Check if speeds are consistent and reasonable
+        speeds = [d['speed'] for d in self.download_times[-3:]]
+        avg_speed = sum(speeds) / len(speeds)
+        
+        # Consider stable if average speed > 5 MB/s and consistent
+        if avg_speed < 5:
+            return False
+        
+        # Check consistency (low variance)
+        if len(speeds) > 1:
+            variance = sum((s - avg_speed) ** 2 for s in speeds) / len(speeds)
+            std_dev = variance ** 0.5
+            cv = std_dev / avg_speed if avg_speed > 0 else 1
+            return cv < 0.5  # Coefficient of variation < 50%
+        
+        return True
+    
+    def get_status_summary(self) -> Dict:
+        """Get current status summary for reporting."""
+        total_downloads = self.success_count + self.error_count
+        error_rate = self.error_count / total_downloads if total_downloads > 0 else 0
+        avg_memory = sum(self.memory_usage_history) / len(self.memory_usage_history) if self.memory_usage_history else 0
+        avg_speed = sum(d['speed'] for d in self.download_times) / len(self.download_times) if self.download_times else 0
+        
+        return {
+            'current_concurrency': self.current_concurrency,
+            'memory_usage_percent': avg_memory,
+            'error_rate': error_rate,
+            'avg_download_speed_mbps': avg_speed,
+            'total_downloads': total_downloads,
+            'success_count': self.success_count,
+            'error_count': self.error_count
+        }
 
 
 class ProgressTracker:
@@ -123,7 +302,8 @@ class ThetaBulkDownloader:
     """
     
     def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 8, 
-                 symbols: List[str] = None, start_date: str = None, end_date: str = None, output_dir: str = None):
+                 symbols: List[str] = None, start_date: str = None, end_date: str = None, output_dir: str = None,
+                 adaptive_concurrency: bool = True):
         """
         Initialize the bulk downloader.
         
@@ -134,11 +314,30 @@ class ThetaBulkDownloader:
             start_date: Start date for organized folder structure
             end_date: End date for organized folder structure
             output_dir: Output directory for storing data (uses organized structure if None)
+            adaptive_concurrency: Enable intelligent concurrency scaling
         """
         self.base_url = base_url
         self.max_concurrent = max_concurrent
         self.session = None
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Initialize adaptive concurrency manager
+        if adaptive_concurrency:
+            # Determine smart initial concurrency based on system
+            memory_gb = psutil.virtual_memory().total / (1024**3)
+            initial_concurrency = min(3 if memory_gb > 16 else 2, max_concurrent)
+            
+            self.concurrency_manager = AdaptiveConcurrencyManager(
+                initial_concurrency=initial_concurrency,
+                max_concurrency=max_concurrent
+            )
+            self.adaptive_mode = True
+        else:
+            self.concurrency_manager = None
+            self.adaptive_mode = False
+        
+        # Initialize semaphore with starting concurrency
+        initial_concurrency = self.concurrency_manager.get_current_concurrency() if self.adaptive_mode else max_concurrent
+        self.semaphore = asyncio.Semaphore(initial_concurrency)
         
         # Initialize market calendar for holiday detection
         self.market_calendar = MarketCalendar()
@@ -295,8 +494,13 @@ class ThetaBulkDownloader:
     async def __aenter__(self):
         """Async context manager entry."""
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),  # 5 minute timeout
-            connector=aiohttp.TCPConnector(limit=self.max_concurrent)
+            timeout=aiohttp.ClientTimeout(total=900, sock_read=180),  # 15 minute total, 3 min read timeout
+            connector=aiohttp.TCPConnector(
+                limit=self.max_concurrent,
+                limit_per_host=self.max_concurrent,
+                keepalive_timeout=60,
+                enable_cleanup_closed=True
+            )
         )
         return self
     
@@ -329,7 +533,7 @@ class ThetaBulkDownloader:
         
         # Skip if already downloaded
         if file_key in self.downloaded_files:
-            logger.info(f"Skipping {file_key} - already downloaded")
+            logger.debug(f"Skipping {file_key} - already downloaded")
             return True
         
         # Format date for API (remove dashes)
@@ -346,6 +550,10 @@ class ThetaBulkDownloader:
         }
         
         output_file = self.get_output_filename(symbol, date, interval)
+        download_start_time = time.time()
+        
+        # Update semaphore if concurrency changed
+        await self._update_semaphore_if_needed()
         
         async with self.semaphore:  # Limit concurrent connections
             try:
@@ -354,42 +562,78 @@ class ThetaBulkDownloader:
                 
                 async with self.session.get(url, params=params) as response:
                     if response.status == 200:
-                        # Stream data directly to file
+                        # Stream data directly to file with larger chunks for big files
                         with open(output_file, 'wb') as f:
-                            async for chunk in response.content.iter_chunked(8192):
+                            chunk_size = 65536  # 64KB chunks for better performance with large files
+                            async for chunk in response.content.iter_chunked(chunk_size):
                                 f.write(chunk)
+                        
+                        download_time = time.time() - download_start_time
                         
                         # Verify file has data (more than just header)
                         if output_file.stat().st_size > 100:  # At least 100 bytes
                             self.downloaded_files.add(file_key)
+                            
+                            # Calculate file size and performance metrics
+                            file_size_mb = output_file.stat().st_size / (1024 * 1024)
+                            
+                            # Record performance for adaptive concurrency
+                            if self.adaptive_mode:
+                                self.concurrency_manager.record_download(True, download_time, file_size_mb)
                             
                             # Quick stats (but don't log individual completions during bulk download)
                             with open(output_file, 'r') as f:
                                 line_count = sum(1 for line in f) - 1  # Subtract header
                             
                             # Only log individual downloads in debug mode
-                            logger.debug(f"✓ Downloaded {symbol} {date} ({interval}): {line_count:,} records, {output_file.stat().st_size:,} bytes")
+                            logger.debug(f"✓ Downloaded {symbol} {date} ({interval}): {line_count:,} records, {file_size_mb:.1f}MB in {download_time:.1f}s")
                             return True
                         else:
+                            download_time = time.time() - download_start_time
+                            if self.adaptive_mode:
+                                self.concurrency_manager.record_download(False, download_time, 0)
+                            
                             logger.warning(f"Downloaded file too small for {symbol} {date} - likely holiday or no trading")
                             output_file.unlink()
                             self.market_calendar.mark_no_data_date(date)
                             return False
                     
                     elif response.status == 404:
+                        download_time = time.time() - download_start_time
+                        if self.adaptive_mode:
+                            self.concurrency_manager.record_download(False, download_time, 0)
+                        
                         # No data available - could be a holiday or early market close
                         logger.warning(f"No data available for {symbol} on {date} - likely holiday or non-trading day")
                         self.market_calendar.mark_no_data_date(date)
                         return False
                     else:
+                        download_time = time.time() - download_start_time
+                        if self.adaptive_mode:
+                            self.concurrency_manager.record_download(False, download_time, 0)
+                        
                         logger.error(f"HTTP {response.status} for {symbol} {date}: {await response.text()}")
                         return False
                         
             except Exception as e:
+                download_time = time.time() - download_start_time
+                if self.adaptive_mode:
+                    self.concurrency_manager.record_download(False, download_time, 0)
+                
                 logger.error(f"Error downloading {symbol} {date}: {e}")
                 if output_file.exists():
                     output_file.unlink()
                 return False
+    
+    async def _update_semaphore_if_needed(self):
+        """Update semaphore if adaptive concurrency has changed."""
+        if not self.adaptive_mode:
+            return
+        
+        current_limit = self.concurrency_manager.get_current_concurrency()
+        if hasattr(self.semaphore, '_value') and self.semaphore._value != current_limit:
+            # Create new semaphore with updated concurrency
+            self.semaphore = asyncio.Semaphore(current_limit)
     
     async def download_symbol_range(self, symbol: str, start_date: str, end_date: str, 
                                   interval: str = "1m", progress_tracker: Optional[ProgressTracker] = None,
@@ -616,6 +860,12 @@ class ThetaBulkDownloader:
             consecutive_failures = 0
             successful_downloads = 0
             
+            # Initialize overall progress tracker for the entire job
+            total_days = len(all_trading_days)
+            overall_progress = ProgressTracker(total_days)
+            print(f"   Total trading days to process: {total_days}")
+            print()
+            
             # Process in chunks to detect boundary faster
             for chunk_start in range(0, len(all_trading_days), chunk_size):
                 chunk_end = min(chunk_start + chunk_size, len(all_trading_days))
@@ -623,8 +873,7 @@ class ThetaBulkDownloader:
                 
                 print(f"   Chunk {chunk_start//chunk_size + 1}: {chunk_dates[0]} to {chunk_dates[-1]} ({len(chunk_dates)} days)")
                 
-                # Download chunk
-                chunk_progress = ProgressTracker(len(chunk_dates))
+                # Track chunk failures but don't show chunk progress bar
                 chunk_failures = 0
                 
                 for date in chunk_dates:
@@ -633,38 +882,36 @@ class ThetaBulkDownloader:
                     # Skip if already downloaded
                     if file_key in self.downloaded_files:
                         symbol_results[date] = True
-                        chunk_progress.update()
+                        overall_progress.update()  # Update overall progress
                         continue
                     
-                    # Log what we're trying
-                    print(f"   Trying {date}...")
-                    
-                    # Download this date
+                    # Download this date (removed individual "Trying" messages to keep output clean)
                     success = await self.download_options_data(symbol, date, interval)
                     symbol_results[date] = success
-                    chunk_progress.update()
+                    overall_progress.update()  # Update overall progress
                     
                     if success:
                         successful_downloads += 1
                         consecutive_failures = 0
-                        print(f"   ✓ {symbol} {date}: SUCCESS")
                     else:
                         consecutive_failures += 1
                         chunk_failures += 1
-                        print(f"   ✗ {symbol} {date}: FAILED (consecutive: {consecutive_failures})")
                         
                         # Check if we should stop
                         if consecutive_failures >= max_consecutive_failures:
-                            chunk_progress.finish()
+                            overall_progress.finish()
                             print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
                             print(f"   Data boundary likely reached around {date}")
                             print(f"   Successfully downloaded {successful_downloads} files")
-                            break
+                            self._print_adaptive_status()
+                            return {symbol: symbol_results}
                     
                     # Small delay to be respectful
                     await asyncio.sleep(0.1)
-                
-                chunk_progress.finish()
+                    
+                    # Periodic status update for adaptive concurrency
+                    if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
+                        self._print_adaptive_status()
                 
                 # If we hit the boundary in this chunk, stop processing this symbol
                 if consecutive_failures >= max_consecutive_failures:
@@ -673,20 +920,25 @@ class ThetaBulkDownloader:
                 # If the entire chunk failed, we're likely past the boundary
                 if chunk_failures == len(chunk_dates):
                     consecutive_failures += chunk_failures
+                    overall_progress.finish()
                     print(f"\n🛑 Entire chunk failed for {symbol}")
                     print(f"   Data boundary likely reached around {chunk_dates[-1]}")
                     print(f"   Successfully downloaded {successful_downloads} files")
-                    break
+                    return {symbol: symbol_results}
                 
-                print(f"   Chunk complete: {chunk_failures} failures, continuing...")
+                # Show chunk summary (but progress bar shows overall progress)
+                print(f"   Chunk complete: {chunk_failures} failures in this chunk")
                 
                 # Small delay between chunks
                 await asyncio.sleep(1)
             
+            # Ensure progress is complete
+            overall_progress.finish()
             all_results[symbol] = symbol_results
             
             print(f"✅ {symbol} complete: {successful_downloads} files downloaded")
             print(f"   Data coverage appears to start around: {self._find_earliest_success(symbol_results)}")
+            self._print_adaptive_status()
             print()
         
         # Save progress
@@ -700,6 +952,19 @@ class ThetaBulkDownloader:
         if successful_dates:
             return min(successful_dates)
         return "No successful downloads"
+    
+    def _print_adaptive_status(self):
+        """Print current adaptive concurrency status."""
+        if not self.adaptive_mode:
+            return
+        
+        status = self.concurrency_manager.get_status_summary()
+        print(f"\n🧠 Adaptive Status:")
+        print(f"   Concurrency: {status['current_concurrency']} workers")
+        print(f"   Memory Usage: {status['memory_usage_percent']:.1f}%")
+        print(f"   Download Speed: {status['avg_download_speed_mbps']:.1f} MB/s")
+        print(f"   Success Rate: {(1-status['error_rate'])*100:.1f}%")
+        print()
     
     def get_download_summary(self) -> Dict:
         """Get summary of downloaded data."""
@@ -796,7 +1061,8 @@ async def main():
             max_concurrent=DOWNLOAD_CONFIG['max_concurrent'],
             symbols=DOWNLOAD_CONFIG['symbols'],
             start_date=DOWNLOAD_CONFIG['start_date'],
-            end_date=DOWNLOAD_CONFIG['end_date']
+            end_date=DOWNLOAD_CONFIG['end_date'],
+            adaptive_concurrency=DOWNLOAD_CONFIG.get('adaptive_concurrency', True)
         ) as downloader:
             # Show resume status
             resume_status = downloader.get_resume_status(
