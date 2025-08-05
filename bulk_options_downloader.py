@@ -7,8 +7,8 @@ using the Standard subscription tier with concurrent requests.
 Based on the bulk download method provided by Theta Data support:
 - URL: http://localhost:25503/v3/option/history/quote?symbol=SYMBOL&expiration=*&date=DATE&interval=INTERVAL
 - Supports all expirations with expiration=*
-- Available intervals: 1m, 5m, 15m, 30m, 1h, 4h, 1d
-- Standard subscription allows 4 concurrent connections
+- Available intervals: 1m, 5m, 15m, 30m, 1h, 4h (daily intervals not supported for options)
+- Standard subscription allows 8 concurrent connections
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from pathlib import Path
 import logging
 import json
 from config import DOWNLOAD_CONFIG, OUTPUT_CONFIG
+from market_calendar import MarketCalendar
 
 # Setup logging
 logging.basicConfig(
@@ -114,21 +115,21 @@ class ThetaBulkDownloader:
     Bulk downloader for Theta Data options history using concurrent requests.
     
     Features:
-    - Respects Standard subscription limit of 4 concurrent connections
+    - Respects Standard subscription limit of 8 concurrent connections
     - Bulk download using expiration=* for all option chains
     - CSV output format for efficient storage
     - Progress tracking and error handling
     - Resumable downloads with duplicate detection
     """
     
-    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 4, 
+    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 8, 
                  symbols: List[str] = None, start_date: str = None, end_date: str = None, output_dir: str = None):
         """
         Initialize the bulk downloader.
         
         Args:
             base_url: Theta Terminal base URL
-            max_concurrent: Maximum concurrent connections (Standard = 4)
+            max_concurrent: Maximum concurrent connections (Standard = 8)
             symbols: List of symbols for organized folder structure
             start_date: Start date for organized folder structure
             end_date: End date for organized folder structure
@@ -138,6 +139,9 @@ class ThetaBulkDownloader:
         self.max_concurrent = max_concurrent
         self.session = None
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Initialize market calendar for holiday detection
+        self.market_calendar = MarketCalendar()
         
         # Use organized directory structure
         if output_dir is None and symbols and start_date and end_date:
@@ -245,24 +249,24 @@ class ThetaBulkDownloader:
     
     def get_resume_status(self, symbols: List[str], start_date: str, end_date: str, interval: str) -> Dict:
         """Get detailed resume status for the requested download job."""
-        # Calculate all required dates
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        # Get trading days using market calendar
+        trading_days = self.market_calendar.get_trading_days(start_date, end_date)
         
+        # Show holiday filtering summary
+        holiday_summary = self.market_calendar.get_holiday_summary(start_date, end_date)
+        logger.info(f"📅 Market Calendar: {holiday_summary['efficiency_gain']}")
+        
+        # Build list of required files based on trading days only
         required_files = []
-        current = start
-        while current <= end:
-            if current.weekday() < 5:  # Only weekdays
-                date_str = current.strftime("%Y-%m-%d")
-                for symbol in symbols:
-                    file_key = self.generate_file_key(symbol, date_str, interval)
-                    required_files.append({
-                        'key': file_key,
-                        'symbol': symbol,
-                        'date': date_str,
-                        'downloaded': file_key in self.downloaded_files
-                    })
-            current += timedelta(days=1)
+        for date_str in trading_days:
+            for symbol in symbols:
+                file_key = self.generate_file_key(symbol, date_str, interval)
+                required_files.append({
+                    'key': file_key,
+                    'symbol': symbol,
+                    'date': date_str,
+                    'downloaded': file_key in self.downloaded_files
+                })
         
         downloaded_count = sum(1 for f in required_files if f['downloaded'])
         total_count = len(required_files)
@@ -316,7 +320,7 @@ class ThetaBulkDownloader:
         Args:
             symbol: Stock symbol (e.g., "QQQ", "SPY", "AAPL")
             date: Date in YYYY-MM-DD format
-            interval: Time interval (1m, 5m, 15m, 30m, 1h, 4h, 1d)
+            interval: Time interval (1m, 5m, 15m, 30m, 1h, 4h)
             
         Returns:
             bool: True if successful, False otherwise
@@ -367,12 +371,15 @@ class ThetaBulkDownloader:
                             logger.debug(f"✓ Downloaded {symbol} {date} ({interval}): {line_count:,} records, {output_file.stat().st_size:,} bytes")
                             return True
                         else:
-                            logger.warning(f"Downloaded file too small for {symbol} {date}, removing")
+                            logger.warning(f"Downloaded file too small for {symbol} {date} - likely holiday or no trading")
                             output_file.unlink()
+                            self.market_calendar.mark_no_data_date(date)
                             return False
                     
                     elif response.status == 404:
-                        logger.warning(f"No data available for {symbol} on {date}")
+                        # No data available - could be a holiday or early market close
+                        logger.warning(f"No data available for {symbol} on {date} - likely holiday or non-trading day")
+                        self.market_calendar.mark_no_data_date(date)
                         return False
                     else:
                         logger.error(f"HTTP {response.status} for {symbol} {date}: {await response.text()}")
@@ -404,22 +411,17 @@ class ThetaBulkDownloader:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
         
-        # Get all dates in range
-        all_dates = []
-        current = start
-        while current <= end:
-            if current.weekday() < 5:  # Only include weekdays
-                all_dates.append(current.strftime("%Y-%m-%d"))
-            current += timedelta(days=1)
+        # Get trading days using market calendar (avoiding holidays and weekends)
+        trading_days = self.market_calendar.get_trading_days(start_date, end_date)
         
         # Filter dates if specific files are provided (for resume)
         if files_to_download is not None:
             dates_to_download = []
             for file_info in files_to_download:
-                if file_info['symbol'] == symbol and file_info['date'] in all_dates:
+                if file_info['symbol'] == symbol and file_info['date'] in trading_days:
                     dates_to_download.append(file_info['date'])
         else:
-            dates_to_download = all_dates
+            dates_to_download = trading_days
         
         # Log at debug level only
         logger.debug(f"Downloading {symbol} options data for {len(dates_to_download)} trading days from {start_date} to {end_date}")
@@ -440,7 +442,8 @@ class ThetaBulkDownloader:
         date_results = {}
         download_index = 0
         
-        for date in all_dates:
+        # Process each trading day
+        for date in dates_to_download:
             file_key = self.generate_file_key(symbol, date, interval)
             
             if date in dates_to_download:
@@ -461,7 +464,7 @@ class ThetaBulkDownloader:
         self._save_download_history()
         
         success_count = sum(1 for success in date_results.values() if success)
-        logger.debug(f"Completed {symbol}: {success_count}/{len(all_dates)} days successful")
+        logger.debug(f"Completed {symbol}: {success_count}/{len(dates_to_download)} days successful")
         
         return date_results
     
@@ -490,6 +493,14 @@ class ThetaBulkDownloader:
         Returns:
             Dict mapping symbol to date results
         """
+        from config import DOWNLOAD_CONFIG
+        
+        # Check if we should work backwards
+        if DOWNLOAD_CONFIG.get('work_backwards', False):
+            return await self.download_backwards_with_boundary_detection(
+                symbols, start_date, end_date, interval
+            )
+        
         logger.info(f"Starting bulk download for {len(symbols)} symbols: {', '.join(symbols)}")
         
         # Get resume status
@@ -567,6 +578,128 @@ class ThetaBulkDownloader:
         
         self._save_download_history()
         return all_results
+    
+    async def download_backwards_with_boundary_detection(self, symbols: List[str], start_date: str, 
+                                                       end_date: str, interval: str = "1m") -> Dict[str, Dict[str, bool]]:
+        """
+        Download data working backwards from end_date, stopping when we hit data boundary.
+        
+        Args:
+            symbols: List of stock symbols
+            start_date: Earliest date to try (boundary)
+            end_date: Start from this date and work backwards
+            interval: Time interval
+            
+        Returns:
+            Dict mapping symbol to date results
+        """
+        from config import DOWNLOAD_CONFIG
+        
+        max_consecutive_failures = DOWNLOAD_CONFIG.get('max_consecutive_failures', 20)
+        chunk_size = DOWNLOAD_CONFIG.get('chunk_size', 50)
+        
+        logger.info(f"Starting BACKWARDS download for {len(symbols)} symbols: {', '.join(symbols)}")
+        print(f"🔄 Working backwards from {end_date} to find data coverage boundary")
+        print(f"   Will stop after {max_consecutive_failures} consecutive failures")
+        print(f"   Processing in chunks of {chunk_size} trading days")
+        print()
+        
+        # Get all trading days in the range
+        all_trading_days = self.market_calendar.get_trading_days(start_date, end_date)
+        # Reverse to work backwards
+        all_trading_days.reverse()
+        
+        all_results = {}
+        for symbol in symbols:
+            print(f"📊 Processing {symbol}...")
+            symbol_results = {}
+            consecutive_failures = 0
+            successful_downloads = 0
+            
+            # Process in chunks to detect boundary faster
+            for chunk_start in range(0, len(all_trading_days), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(all_trading_days))
+                chunk_dates = all_trading_days[chunk_start:chunk_end]
+                
+                print(f"   Chunk {chunk_start//chunk_size + 1}: {chunk_dates[0]} to {chunk_dates[-1]} ({len(chunk_dates)} days)")
+                
+                # Download chunk
+                chunk_progress = ProgressTracker(len(chunk_dates))
+                chunk_failures = 0
+                
+                for date in chunk_dates:
+                    file_key = self.generate_file_key(symbol, date, interval)
+                    
+                    # Skip if already downloaded
+                    if file_key in self.downloaded_files:
+                        symbol_results[date] = True
+                        chunk_progress.update()
+                        continue
+                    
+                    # Log what we're trying
+                    print(f"   Trying {date}...")
+                    
+                    # Download this date
+                    success = await self.download_options_data(symbol, date, interval)
+                    symbol_results[date] = success
+                    chunk_progress.update()
+                    
+                    if success:
+                        successful_downloads += 1
+                        consecutive_failures = 0
+                        print(f"   ✓ {symbol} {date}: SUCCESS")
+                    else:
+                        consecutive_failures += 1
+                        chunk_failures += 1
+                        print(f"   ✗ {symbol} {date}: FAILED (consecutive: {consecutive_failures})")
+                        
+                        # Check if we should stop
+                        if consecutive_failures >= max_consecutive_failures:
+                            chunk_progress.finish()
+                            print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
+                            print(f"   Data boundary likely reached around {date}")
+                            print(f"   Successfully downloaded {successful_downloads} files")
+                            break
+                    
+                    # Small delay to be respectful
+                    await asyncio.sleep(0.1)
+                
+                chunk_progress.finish()
+                
+                # If we hit the boundary in this chunk, stop processing this symbol
+                if consecutive_failures >= max_consecutive_failures:
+                    break
+                
+                # If the entire chunk failed, we're likely past the boundary
+                if chunk_failures == len(chunk_dates):
+                    consecutive_failures += chunk_failures
+                    print(f"\n🛑 Entire chunk failed for {symbol}")
+                    print(f"   Data boundary likely reached around {chunk_dates[-1]}")
+                    print(f"   Successfully downloaded {successful_downloads} files")
+                    break
+                
+                print(f"   Chunk complete: {chunk_failures} failures, continuing...")
+                
+                # Small delay between chunks
+                await asyncio.sleep(1)
+            
+            all_results[symbol] = symbol_results
+            
+            print(f"✅ {symbol} complete: {successful_downloads} files downloaded")
+            print(f"   Data coverage appears to start around: {self._find_earliest_success(symbol_results)}")
+            print()
+        
+        # Save progress
+        self._save_download_history()
+        
+        return all_results
+    
+    def _find_earliest_success(self, symbol_results: Dict[str, bool]) -> str:
+        """Find the earliest date with successful download."""
+        successful_dates = [date for date, success in symbol_results.items() if success]
+        if successful_dates:
+            return min(successful_dates)
+        return "No successful downloads"
     
     def get_download_summary(self) -> Dict:
         """Get summary of downloaded data."""
