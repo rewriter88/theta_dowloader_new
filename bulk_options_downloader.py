@@ -34,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 import json
 import time
+import sys
 from typing import List, Dict, Optional, Set
 import logging
 
@@ -47,6 +48,66 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+class ProgressTracker:
+    """Real-time progress tracker with ETA calculation."""
+    
+    def __init__(self, total_tasks: int):
+        self.total_tasks = total_tasks
+        self.completed_tasks = 0
+        self.start_time = time.time()
+        self.last_update = self.start_time
+        
+    def update(self, increment: int = 1):
+        """Update progress and display current status."""
+        self.completed_tasks += increment
+        current_time = time.time()
+        
+        # Calculate progress percentage
+        progress_percent = (self.completed_tasks / self.total_tasks) * 100
+        
+        # Calculate ETA
+        elapsed_time = current_time - self.start_time
+        if self.completed_tasks > 0:
+            avg_time_per_task = elapsed_time / self.completed_tasks
+            remaining_tasks = self.total_tasks - self.completed_tasks
+            eta_seconds = remaining_tasks * avg_time_per_task
+            eta_str = self._format_time(eta_seconds)
+        else:
+            eta_str = "Calculating..."
+        
+        # Create progress bar
+        bar_length = 30
+        filled_length = int(bar_length * self.completed_tasks // self.total_tasks)
+        bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        
+        # Display progress (overwrite previous line)
+        progress_line = f"\r📊 Progress: [{bar}] {progress_percent:.1f}% ({self.completed_tasks}/{self.total_tasks}) | ETA: {eta_str}"
+        sys.stdout.write(progress_line)
+        sys.stdout.flush()
+        
+        # Add newline when complete
+        if self.completed_tasks >= self.total_tasks:
+            print()  # New line after completion
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds into human-readable time."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            minutes = seconds / 60
+            return f"{minutes:.1f}m"
+        else:
+            hours = seconds / 3600
+            return f"{hours:.1f}h"
+    
+    def finish(self):
+        """Mark progress as complete."""
+        if self.completed_tasks < self.total_tasks:
+            self.completed_tasks = self.total_tasks
+            self.update(0)
+
 
 class ThetaBulkDownloader:
     """
@@ -172,7 +233,8 @@ class ThetaBulkDownloader:
         
         async with self.semaphore:  # Limit concurrent connections
             try:
-                logger.info(f"Downloading {symbol} options data for {date} ({interval}) - URL: {url}")
+                # Log only at debug level to keep progress display clean
+                logger.debug(f"Downloading {symbol} options data for {date} ({interval}) - URL: {url}")
                 
                 async with self.session.get(url, params=params) as response:
                     if response.status == 200:
@@ -185,11 +247,12 @@ class ThetaBulkDownloader:
                         if output_file.stat().st_size > 100:  # At least 100 bytes
                             self.downloaded_files.add(file_key)
                             
-                            # Quick stats
+                            # Quick stats (but don't log individual completions during bulk download)
                             with open(output_file, 'r') as f:
                                 line_count = sum(1 for line in f) - 1  # Subtract header
                             
-                            logger.info(f"✓ Downloaded {symbol} {date} ({interval}): {line_count:,} records, {output_file.stat().st_size:,} bytes")
+                            # Only log individual downloads in debug mode
+                            logger.debug(f"✓ Downloaded {symbol} {date} ({interval}): {line_count:,} records, {output_file.stat().st_size:,} bytes")
                             return True
                         else:
                             logger.warning(f"Downloaded file too small for {symbol} {date}, removing")
@@ -210,7 +273,7 @@ class ThetaBulkDownloader:
                 return False
     
     async def download_symbol_range(self, symbol: str, start_date: str, end_date: str, 
-                                  interval: str = "1m") -> Dict[str, bool]:
+                                  interval: str = "1m", progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, bool]:
         """
         Download options data for a symbol across a date range.
         
@@ -219,6 +282,7 @@ class ThetaBulkDownloader:
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
             interval: Time interval
+            progress_tracker: Optional progress tracker for UI updates
             
         Returns:
             Dict mapping date to success status
@@ -234,10 +298,16 @@ class ThetaBulkDownloader:
                 dates.append(current.strftime("%Y-%m-%d"))
             current += timedelta(days=1)
         
-        logger.info(f"Downloading {symbol} options data for {len(dates)} trading days from {start_date} to {end_date}")
+        # Log at debug level only
+        logger.debug(f"Downloading {symbol} options data for {len(dates)} trading days from {start_date} to {end_date}")
         
-        # Download dates concurrently
-        tasks = [self.download_options_data(symbol, date, interval) for date in dates]
+        # Create download tasks
+        tasks = []
+        for date in dates:
+            task = self._download_with_progress(symbol, date, interval, progress_tracker)
+            tasks.append(task)
+        
+        # Execute downloads concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Process results
@@ -253,9 +323,20 @@ class ThetaBulkDownloader:
         self._save_download_history()
         
         success_count = sum(1 for success in date_results.values() if success)
-        logger.info(f"Completed {symbol}: {success_count}/{len(dates)} days successful")
+        logger.debug(f"Completed {symbol}: {success_count}/{len(dates)} days successful")
         
         return date_results
+    
+    async def _download_with_progress(self, symbol: str, date: str, interval: str, 
+                                    progress_tracker: Optional[ProgressTracker] = None) -> bool:
+        """Download with progress tracking wrapper."""
+        result = await self.download_options_data(symbol, date, interval)
+        
+        # Update progress if tracker is provided
+        if progress_tracker:
+            progress_tracker.update()
+        
+        return result
     
     async def download_multiple_symbols(self, symbols: List[str], start_date: str, 
                                       end_date: str, interval: str = "1m") -> Dict[str, Dict[str, bool]]:
@@ -273,13 +354,37 @@ class ThetaBulkDownloader:
         """
         logger.info(f"Starting bulk download for {len(symbols)} symbols: {', '.join(symbols)}")
         
+        # Calculate total number of trading days for progress tracking
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        total_days = 0
+        current = start
+        while current <= end:
+            if current.weekday() < 5:  # Only count weekdays
+                total_days += 1
+            current += timedelta(days=1)
+        
+        total_tasks = len(symbols) * total_days
+        progress_tracker = ProgressTracker(total_tasks)
+        
+        print(f"📅 Downloading {total_days} trading days for {len(symbols)} symbol(s) - {total_tasks} total files")
+        print()  # Space for progress bar
+        
         all_results = {}
         for symbol in symbols:
-            logger.info(f"Processing symbol {symbol}...")
-            all_results[symbol] = await self.download_symbol_range(symbol, start_date, end_date, interval)
+            symbol_results = await self.download_symbol_range(
+                symbol, start_date, end_date, interval, progress_tracker
+            )
+            all_results[symbol] = symbol_results
             
             # Small delay between symbols to be respectful
-            await asyncio.sleep(1)
+            if len(symbols) > 1:
+                await asyncio.sleep(1)
+        
+        # Ensure progress is complete
+        progress_tracker.finish()
+        print()  # Space after progress completion
         
         self._save_download_history()
         return all_results
@@ -378,6 +483,7 @@ async def main():
             
             # Download data
             print("🚀 Starting download...")
+            
             results = await downloader.download_multiple_symbols(
                 DOWNLOAD_CONFIG['symbols'], 
                 DOWNLOAD_CONFIG['start_date'], 
@@ -387,7 +493,7 @@ async def main():
             
             # Show final results
             final_summary = downloader.get_download_summary()
-            print(f"\n✅ Download complete! Data stored in: {OUTPUT_CONFIG['options_dir']}")
+            print(f"✅ Download complete! Data stored in: {OUTPUT_CONFIG['options_dir']}")
             print(f"📊 Final Summary:")
             print(f"   Total Files: {final_summary['total_files']}")
             print(f"   Total Size: {final_summary['total_size_bytes']:,} bytes")
