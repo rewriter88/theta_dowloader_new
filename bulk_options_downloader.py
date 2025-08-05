@@ -18,6 +18,20 @@ from datetime import datetime, timedelta
 import csv
 import os
 from pathlib import Path
+import logging
+import json
+from config import DOWNLOAD_CONFIG, OUTPUT_CONFIG
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('theta_downloader.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 import json
 import time
 from typing import List, Dict, Optional, Set
@@ -322,23 +336,62 @@ async def main():
             end_date=end_date,
             interval="1m"
         )
+async def main():
+    """Main function to run the bulk downloader."""
+    print("=" * 60)
+    print("THETA DATA BULK OPTIONS DOWNLOADER")
+    print("=" * 60)
+    
+    # Display configuration
+    print(f"📊 Configuration:")
+    print(f"   Symbols: {', '.join(DOWNLOAD_CONFIG['symbols'])}")
+    print(f"   Date Range: {DOWNLOAD_CONFIG['start_date']} to {DOWNLOAD_CONFIG['end_date']}")
+    print(f"   Interval: {DOWNLOAD_CONFIG['interval']}")
+    print(f"   Max Concurrent: {DOWNLOAD_CONFIG['max_concurrent']}")
+    print(f"   Data Storage: {OUTPUT_CONFIG['options_dir']}")
+    print()
+    
+    try:
+        # Create downloader instance and use as async context manager
+        async with ThetaBulkDownloader(max_concurrent=DOWNLOAD_CONFIG['max_concurrent']) as downloader:
+            # Show existing data summary
+            summary = downloader.get_download_summary()
+            
+            if summary['total_files'] > 0:
+                print(f"📁 Found {summary['total_files']} existing files ({summary['total_size_bytes']:,} bytes)")
+                print(f"   Symbols: {', '.join(summary['symbols'])}")
+                if summary['date_range']['min']:
+                    print(f"   Date Range: {summary['date_range']['min']} to {summary['date_range']['max']}")
+                print()
+            
+            # Download data
+            print("🚀 Starting download...")
+            results = await downloader.download_multiple_symbols(
+                DOWNLOAD_CONFIG['symbols'], 
+                DOWNLOAD_CONFIG['start_date'], 
+                DOWNLOAD_CONFIG['end_date'], 
+                DOWNLOAD_CONFIG['interval']
+            )
+            
+            # Show final results
+            final_summary = downloader.get_download_summary()
+            print(f"\n✅ Download complete! Data stored in: {OUTPUT_CONFIG['options_dir']}")
+            print(f"📊 Final Summary:")
+            print(f"   Total Files: {final_summary['total_files']}")
+            print(f"   Total Size: {final_summary['total_size_bytes']:,} bytes")
+            print(f"   Symbols: {', '.join(final_summary['symbols'])}")
+            if final_summary['date_range']['min']:
+                print(f"   Date Range: {final_summary['date_range']['min']} to {final_summary['date_range']['max']}")
+            
+            return results
         
-        # Print results summary
-        print("\n" + "="*60)
-        print("DOWNLOAD RESULTS SUMMARY")
-        print("="*60)
-        
-        for symbol, date_results in results.items():
-            success_count = sum(1 for success in date_results.values() if success)
-            total_count = len(date_results)
-            print(f"{symbol}: {success_count}/{total_count} days successful")
-        
-        # Get overall summary
-        summary = downloader.get_download_summary()
-        print(f"\nTotal files downloaded: {summary['total_files']}")
-        print(f"Total data size: {summary['total_size_mb']} MB")
-        print(f"Symbols: {', '.join(summary['symbols'])}")
-        print(f"Date range: {summary['date_range']['min']} to {summary['date_range']['max']}")
+    except Exception as e:
+        import traceback
+        logger.error(f"Download failed: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        print(f"\n❌ Error during download: {e}")
+        print(f"Full traceback:\n{traceback.format_exc()}")
+        return None
 
 
 if __name__ == "__main__":
