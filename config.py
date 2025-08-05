@@ -12,7 +12,7 @@ DOWNLOAD_CONFIG = {
     
     # Date range for download (8+ YEARS of QQQ historical data!)
     "start_date": "2016-08-04",  # 8+ years back - will find actual boundary
-    "end_date": "2025-08-05",    # Today - start from here and work backwards
+    "end_date": "2024-08-04",    # Start from August 4, 2024 and work backwards
     
     # Time interval for data
     "interval": "1m",  # Options: 1m, 5m, 15m, 30m, 1h, 4h
@@ -25,7 +25,7 @@ DOWNLOAD_CONFIG = {
     
     # Smart download settings
     "work_backwards": True,  # Start from end_date and work backwards
-    "max_consecutive_failures": 20,  # Stop if we get this many consecutive 472 errors
+    "max_consecutive_failures": 100,  # Allow more failures to find data boundary
     "chunk_size": 50,  # Download in chunks to detect boundary faster
     
     # Adaptive Concurrency Settings

@@ -235,10 +235,13 @@ class ProgressTracker:
     def __init__(self, total_tasks: int):
         self.total_tasks = total_tasks
         self.completed_tasks = 0
+        self.successful_downloads = 0  # Track actual data downloads
         self.start_time = time.time()
         self.recent_downloads = []  # Track recent downloads for speed calculation
         self._console_handler = None
         self._original_level = None
+        self.status = "🔄 RUNNING"  # Status indicator: RUNNING, SEARCHING, STOPPED, COMPLETE
+        self.last_update_time = time.time()
         
         # Show initial progress immediately
         self.update(0)  # Show initial state
@@ -267,8 +270,20 @@ class ProgressTracker:
         self.completed_tasks += increment
         current_time = time.time()
         
+        # Update status based on activity
+        time_since_last_update = current_time - self.last_update_time
+        if increment > 0:
+            self.last_update_time = current_time
+            if file_size_mb > 0:
+                self.status = "🔄 DOWNLOADING"
+            else:
+                self.status = "🔍 SEARCHING"
+        elif time_since_last_update > 30:  # No updates for 30 seconds
+            self.status = "⏸️ STALLED"
+        
         # Track downloads for speed calculation
         if file_size_mb > 0:
+            self.successful_downloads += increment
             self.recent_downloads.append({
                 'time': current_time,
                 'size_mb': file_size_mb
@@ -282,12 +297,16 @@ class ProgressTracker:
         # Calculate progress percentage
         progress_percent = (self.completed_tasks / self.total_tasks) * 100 if self.total_tasks > 0 else 0
         
-        # Calculate ETA
+        # Calculate ETA based only on actual data downloads (files with size > 0)
         elapsed_time = current_time - self.start_time
-        if self.completed_tasks > 0:
-            avg_time_per_task = elapsed_time / self.completed_tasks
+        actual_data_files = len([d for d in self.recent_downloads if d.get('size_mb', 0) > 0])
+        
+        if actual_data_files > 0 and elapsed_time > 30:  # Wait 30 seconds and need actual downloads
+            # Use only successful downloads for ETA calculation
+            avg_time_per_actual_file = elapsed_time / actual_data_files
+            # Assume remaining files will be actual data (not failures)
             remaining_tasks = self.total_tasks - self.completed_tasks
-            eta_seconds = remaining_tasks * avg_time_per_task
+            eta_seconds = remaining_tasks * avg_time_per_actual_file
             eta_str = self._format_time(eta_seconds)
         else:
             eta_str = "Calculating..."
@@ -300,15 +319,22 @@ class ProgressTracker:
         filled_length = int(bar_length * self.completed_tasks // self.total_tasks) if self.total_tasks > 0 else 0
         bar = '█' * filled_length + '░' * (bar_length - filled_length)
         
-        # Single clean progress line
-        progress_line = f"\r📈 [{bar}] {progress_percent:.1f}% ({self.completed_tasks:,}/{self.total_tasks:,}) | {speed_str} | ETA: {eta_str}"
-        sys.stdout.write('\r' + ' ' * 100 + '\r')  # Clear any previous content
+        # Single clean progress line with status
+        progress_line = f"\r📈 [{bar}] {progress_percent:.1f}% ({self.completed_tasks:,}/{self.total_tasks:,}) | {speed_str} | ETA: {eta_str} | {self.status}"
+        sys.stdout.write('\r' + ' ' * 120 + '\r')  # Clear any previous content (increased width)
         sys.stdout.write(progress_line)
         sys.stdout.flush()
         
         # Add newline when complete
         if self.completed_tasks >= self.total_tasks:
+            self.status = "✅ COMPLETE"
             print()  # New line after completion
+    
+    def set_status(self, status: str):
+        """Manually set the status indicator."""
+        self.status = status
+        # Trigger a display update without incrementing
+        self.update(0)
     
     def _calculate_speed(self) -> str:
         """Calculate current download speed from recent downloads."""
@@ -1028,13 +1054,17 @@ class ThetaBulkDownloader:
                             consecutive_failures += 1
                             chunk_failures += 1
                             
-                            # Check if we should stop
+                            # Check if we should continue searching for data boundary
                             if consecutive_failures >= max_consecutive_failures:
-                                print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
-                                print(f"   Data boundary likely reached around {date}")
-                                print(f"   Successfully downloaded {successful_downloads} files")
-                                self._print_adaptive_status()
-                                return {symbol: symbol_results}
+                                print(f"\n🔍 Individual search boundary: {consecutive_failures} consecutive failures")
+                                print(f"   Continuing past {date} to find historical data...")
+                                # Allow extensive search but set reasonable limit
+                                if consecutive_failures >= max_consecutive_failures * 3:  # 300 failures = ~6 months
+                                    print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
+                                    print(f"   Extensive search complete - no data found after {consecutive_failures} attempts")
+                                    print(f"   Successfully downloaded {successful_downloads} files")
+                                    self._print_adaptive_status()
+                                    return {symbol: symbol_results}
                         
                         # Small delay to be respectful
                         await asyncio.sleep(0.1)
@@ -1043,17 +1073,21 @@ class ThetaBulkDownloader:
                         if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
                             self._print_adaptive_status()
                 
-                    # If we hit the boundary in this chunk, stop processing this symbol
+                    # If we hit the boundary in this chunk, continue searching for data
                     if consecutive_failures >= max_consecutive_failures:
-                        break
+                        print(f"\n🔍 Searching for data boundary... ({consecutive_failures} consecutive failures)")
+                        print(f"   Continuing past {chunk_dates[-1]} to find historical data...")
+                        # Reset counter to allow more searching, but keep a reasonable limit
+                        if consecutive_failures >= max_consecutive_failures * 3:  # 300 failures = ~6 months of empty data
+                            print(f"\n🛑 Extensive search complete - no data found after {consecutive_failures} attempts")
+                            break
                     
-                    # If the entire chunk failed, we're likely past the boundary
+                    # If the entire chunk failed, we're in a boundary area but should continue
                     if chunk_failures == len(chunk_dates):
                         consecutive_failures += chunk_failures
-                        print(f"\n🛑 Entire chunk failed for {symbol}")
-                        print(f"   Data boundary likely reached around {chunk_dates[-1]}")
-                        logger.info(f"Successfully downloaded {successful_downloads} files")
-                        return {symbol: symbol_results}
+                        print(f"\n� Empty data period around {chunk_dates[-1]} ({chunk_failures} dates)")
+                        print(f"   Total consecutive failures: {consecutive_failures}")
+                        # Continue searching instead of stopping immediately
                     
                     # Log chunk completion to file only  
                     logger.debug(f"Chunk complete: {chunk_failures} failures in this chunk")
@@ -1109,13 +1143,17 @@ class ThetaBulkDownloader:
                                 consecutive_failures += 1
                                 chunk_failures += 1
                                 
-                                # Check if we should stop
+                                # Check if we should continue searching for data boundary
                                 if consecutive_failures >= max_consecutive_failures:
-                                    print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
-                                    print(f"   Data boundary likely reached around {date}")
-                                    print(f"   Successfully downloaded {successful_downloads} files")
-                                    self._print_adaptive_status()
-                                    return {symbol: symbol_results}
+                                    print(f"\n🔍 Individual search boundary: {consecutive_failures} consecutive failures")
+                                    print(f"   Continuing past {date} to find historical data...")
+                                    # Allow extensive search but set reasonable limit
+                                    if consecutive_failures >= max_consecutive_failures * 3:  # 300 failures = ~6 months
+                                        print(f"\n🛑 Stopping {symbol}: {consecutive_failures} consecutive failures")
+                                        print(f"   Extensive search complete - no data found after {consecutive_failures} attempts")
+                                        print(f"   Successfully downloaded {successful_downloads} files")
+                                        self._print_adaptive_status()
+                                        return {symbol: symbol_results}
                             
                             # Small delay to be respectful
                             await asyncio.sleep(0.1)
@@ -1124,17 +1162,21 @@ class ThetaBulkDownloader:
                             if self.adaptive_mode and successful_downloads > 0 and successful_downloads % 20 == 0:
                                 self._print_adaptive_status()
                     
-                        # If we hit the boundary in this chunk, stop processing this symbol
+                        # If we hit the boundary in this chunk, continue searching for data
                         if consecutive_failures >= max_consecutive_failures:
-                            break
+                            print(f"\n🔍 Searching for data boundary... ({consecutive_failures} consecutive failures)")
+                            print(f"   Continuing past {chunk_dates[-1]} to find historical data...")
+                            # Reset counter to allow more searching, but keep a reasonable limit
+                            if consecutive_failures >= max_consecutive_failures * 3:  # 300 failures = ~6 months of empty data
+                                print(f"\n🛑 Extensive search complete - no data found after {consecutive_failures} attempts")
+                                break
                         
-                        # If the entire chunk failed, we're likely past the boundary
+                        # If the entire chunk failed, we're in a boundary area but should continue
                         if chunk_failures == len(chunk_dates):
                             consecutive_failures += chunk_failures
-                            print(f"\n🛑 Entire chunk failed for {symbol}")
-                            logger.info(f"Data boundary likely reached around {chunk_dates[-1]}")
-                            logger.info(f"Successfully downloaded {successful_downloads} files")
-                            return {symbol: symbol_results}
+                            print(f"\n� Empty data period around {chunk_dates[-1]} ({chunk_failures} dates)")
+                            print(f"   Total consecutive failures: {consecutive_failures}")
+                            # Continue searching instead of stopping immediately
                         
                         # Log chunk completion to file only
                         logger.debug(f"Chunk complete: {chunk_failures} failures in this chunk")

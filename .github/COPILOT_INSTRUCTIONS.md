@@ -9,3 +9,5 @@ This program is for downloading data for real trading. Fake data, estimations, o
 **ONLY use real data from Theta Data API calls.**
 
 When I say commit I always mean local and github.  Only do this when I tell you to.
+
+Today is august 4 2025.  
