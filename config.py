@@ -7,12 +7,12 @@ from datetime import datetime, timedelta
 
 # Download Configuration
 DOWNLOAD_CONFIG = {
-    # Symbols to download (add/remove as needed)
-    "symbols": ["QQQ"],  # Testing with just QQQ first
+    # Symbols to download (QQQ only as requested)
+    "symbols": ["QQQ"],
     
-    # Date range for download
+    # Date range for download (testing a few days)
     "start_date": "2024-11-01",  # YYYY-MM-DD format
-    "end_date": "2024-11-04",    # YYYY-MM-DD format (4 trading days for test)
+    "end_date": "2024-11-04",    # YYYY-MM-DD format (few days test)
     
     # Time interval for data
     "interval": "1m",  # Options: 1m, 5m, 15m, 30m, 1h, 4h, 1d
@@ -26,9 +26,9 @@ DOWNLOAD_CONFIG = {
 
 # Output Configuration
 OUTPUT_CONFIG = {
-    # Directory where data will be stored
-    "results_dir": "results",
-    "options_dir": "results/options",
+    # Directory where data will be stored on external SSD
+    "results_dir": "/Volumes/SSD 4TB/Theta_Data",
+    "options_dir": "/Volumes/SSD 4TB/Theta_Data/options",
     
     # File naming format
     "filename_format": "{symbol}_options_{date}_{interval}.csv",

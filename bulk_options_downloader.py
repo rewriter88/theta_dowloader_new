@@ -60,23 +60,32 @@ class ThetaBulkDownloader:
     - Resumable downloads with duplicate detection
     """
     
-    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 4):
+    def __init__(self, base_url: str = "http://localhost:25503", max_concurrent: int = 4, output_dir: str = None):
         """
         Initialize the bulk downloader.
         
         Args:
             base_url: Theta Terminal base URL
             max_concurrent: Maximum concurrent connections (Standard = 4)
+            output_dir: Output directory for storing data (uses config if None)
         """
         self.base_url = base_url
         self.max_concurrent = max_concurrent
         self.session = None
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
+        # Use output directory from config or default
+        if output_dir is None:
+            from config import OUTPUT_CONFIG
+            output_dir = OUTPUT_CONFIG['options_dir']
+        
         # Create results directory structure
-        self.results_dir = Path("results")
-        self.options_dir = self.results_dir / "options"
+        self.options_dir = Path(output_dir)
         self.options_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Results dir for tracking files (keeping separate from data)
+        self.results_dir = Path("results")
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         
         # Track downloaded files to avoid duplicates
         self.downloaded_files: Set[str] = set()
@@ -353,7 +362,10 @@ async def main():
     
     try:
         # Create downloader instance and use as async context manager
-        async with ThetaBulkDownloader(max_concurrent=DOWNLOAD_CONFIG['max_concurrent']) as downloader:
+        async with ThetaBulkDownloader(
+            max_concurrent=DOWNLOAD_CONFIG['max_concurrent'],
+            output_dir=OUTPUT_CONFIG['options_dir']
+        ) as downloader:
             # Show existing data summary
             summary = downloader.get_download_summary()
             
