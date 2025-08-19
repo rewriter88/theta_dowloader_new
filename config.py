@@ -10,26 +10,29 @@ DOWNLOAD_CONFIG = {
     # Symbols to download (QQQ only as requested)
     "symbols": ["QQQ"],
     
-    # Date range for download (8+ YEARS of QQQ historical data!)
-    "start_date": "2016-08-04",  # 8+ years back - will find actual boundary
-    "end_date": "2024-08-04",    # Start from August 4, 2024 and work backwards
+    # Date range for download (QQQ historical data from subscription limit to existing data)
+    "start_date": "2016-01-01",  # Standard subscription limit - earliest available date
+    "end_date": "2022-08-21",    # Day before existing data starts (you have 2022-08-22 onwards)
     
     # Time interval for data
     "interval": "1m",  # Options: 1m, 5m, 15m, 30m, 1h, 4h
     
-    # Maximum concurrent connections (adaptive system will scale intelligently)
-    "max_concurrent": 12,  # Increased max - adaptive system will find optimal level
+    # Maximum concurrent connections (simple fixed limit)
+    "max_concurrent": 4,  # Simple fixed concurrency
     
     # Theta Terminal URL
     "base_url": "http://localhost:25503",
     
     # Smart download settings
-    "work_backwards": True,  # Start from end_date and work backwards
-    "max_consecutive_failures": 100,  # Allow more failures to find data boundary
-    "chunk_size": 50,  # Download in chunks to detect boundary faster
+    "work_backwards": False,  # Use simple forward chronological order
+    "max_consecutive_failures": 5,  # Low limit - just skip missing dates
+    "chunk_size": 10,  # Small chunks for simple processing
     
     # Adaptive Concurrency Settings
-    "adaptive_concurrency": True,  # Enable intelligent concurrency scaling
+    "adaptive_concurrency": False,  # Disable complex adaptive features
+    
+    # Simple Mode Settings
+    "skip_existing_check": True,  # Skip scanning for existing files - just download requested dates
 }
 
 # Output Configuration
