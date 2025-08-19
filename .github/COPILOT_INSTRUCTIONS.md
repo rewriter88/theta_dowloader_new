@@ -15,3 +15,5 @@ Today is august 4 2025.
 Never apply cosmetic fixes just to please me.
 
 What is displayed to the user must be TRUE 100% of the time.  NOt just something there to tell the user what he wants to hear.
+
+If any instruction you gave take smore than 15 seconds, asume that something is wrong, and move on to the next step or try and fix things.

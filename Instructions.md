@@ -124,6 +124,14 @@ python3 simple_downloader.py
 ls -la /Volumes/SSD\ 4TB/Theta_Data/options/QQQ_1m/*/
 ```
 
+## Tested Symbols
+Successfully downloaded 1-minute interval data (2012-09-04 to 2025-08-19):
+- SPY, IWM (ETFs)
+- NVDA, MSFT, AAPL, AMZN, GOOGL, META, AVGO, TSLA (Tech giants)
+- NFLX, COST (Consumer stocks)
+- ASML (Semiconductor equipment - 11th largest Nasdaq 100)
+- ETHA (ETH ETF for crypto exposure)
+
 ## Support
 For issues with the downloader, check:
 1. Theta Terminal logs
